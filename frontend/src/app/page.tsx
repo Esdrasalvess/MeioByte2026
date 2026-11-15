@@ -1,7 +1,9 @@
-export default function Home() {
+import SkyMap from '@/app/components/SkyMap';
+
+export default function Page() {
   return (
-    <main>
-      <div>Hello world!</div>
+    <main className="min-h-screen bg-black text-white">
+      <SkyMap />
     </main>
   );
 }
