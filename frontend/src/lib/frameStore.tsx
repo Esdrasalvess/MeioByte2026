@@ -22,6 +22,8 @@ let queue: string[] = [];
 let running = 0;
 let lastWanted: string[] = [];
 let version = 0;
+let wantedAt = 0; // quando começou o lote atual
+let finished = 0; // quantos terminaram desde então (para estimar o tempo que falta)
 const listeners = new Set<() => void>();
 
 const emit = () => {
@@ -39,6 +41,39 @@ export const getSlot = (key: string): Slot | undefined => slots.get(key);
 
 // Re-renderiza o componente quando qualquer slot muda (devolve só um contador)
 export const useFrameStore = () => useSyncExternalStore(subscribe, getVersion, getVersion);
+
+// Andamento do lote pedido por último
+export function progress() {
+  let done = 0, pending = 0, ok = 0, err = 0, nocov = 0;
+  for (const k of lastWanted) {
+    const s = slots.get(k);
+    if (!s || s.status === 'queued' || s.status === 'loading') pending++;
+    else {
+      done++;
+      if (s.status === 'ok') ok++;
+      else if (s.status === 'err') err++;
+      else nocov++;
+    }
+  }
+  return { total: lastWanted.length, done, pending, ok, err, nocov, finished, elapsedMs: wantedAt ? Date.now() - wantedAt : 0 };
+}
+
+// 0, último, meio, quartos... (cobre o período inteiro cedo, em vez de só o começo)
+function spreadOrder(n: number): number[] {
+  if (n <= 2) return Array.from({ length: n }, (_, i) => i);
+  const out = [0, n - 1];
+  const seen = new Set(out);
+  const q: [number, number][] = [[0, n - 1]];
+  while (q.length) {
+    const [a, b] = q.shift()!;
+    const m = (a + b) >> 1;
+    if (m === a || m === b || seen.has(m)) continue;
+    seen.add(m);
+    out.push(m);
+    q.push([a, m], [m, b]);
+  }
+  return out;
+}
 
 const sleep = (ms: number, signal: AbortSignal) =>
   new Promise<void>((resolve) => {
@@ -74,6 +109,7 @@ async function run(key: string, t: Target, myCtrl: AbortController) {
   const url = `/api/align?url=${encodeURIComponent(key)}&ra=${t.ra}&dec=${t.dec}&fov=${t.fov}`;
   const r = await fetchAligned(url, myCtrl.signal);
   if (myCtrl !== ctrl) return; // o alvo mudou enquanto baixava: descarta
+  finished++;
   if (r.kind === 'ok') {
     let ok = 0;
     for (let i = 0; i < r.data.length; i++) if (Number.isFinite(r.data[i])) ok++;
@@ -115,17 +151,24 @@ export function setTarget(t: Target) {
   slots.clear();
   queue = [];
   lastWanted = [];
+  wantedAt = 0;
+  finished = 0;
   emit();
 }
 
-// Declara quais frames (na ordem desejada) devem estar baixados. O que estava na fila e não está mais na lista sai dela.
-// O que já está baixando termina; o que já deu certo/erro/sem cobertura fica como está.
+// Declara quais frames (em ordem de data) devem estar baixados. Eles são baixados em ordem espalhada no tempo.
+// O que estava na fila e saiu da lista é removido; o que já está baixando termina; o que já terminou fica.
 export function want(keys: string[]) {
+  if (keys.some((k) => !slots.has(k))) {
+    wantedAt = Date.now();
+    finished = 0;
+  }
   lastWanted = keys;
   const wanted = new Set(keys);
   for (const k of queue) if (!wanted.has(k)) slots.delete(k);
   queue = [];
-  for (const k of keys) {
+  for (const i of spreadOrder(keys.length)) {
+    const k = keys[i];
     const s = slots.get(k);
     if (!s) {
       slots.set(k, { status: 'queued' });

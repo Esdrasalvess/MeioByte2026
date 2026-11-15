@@ -3,7 +3,8 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { keyOf, detOf, timeOf, mjdToDate, sortByTime, summarize, renderImage } from '../../lib/timeline';
-import { setTarget, want, retryErrors, getSlot, useFrameStore, type Loaded } from '../../lib/frameStore';
+import { setTarget, want, retryErrors, getSlot, progress, useFrameStore, type Loaded } from '../../lib/frameStore';
+import { Radar, Bar, Skeleton, Steps, useElapsed, fmtEta } from './Feedback';
 
 type Center = { ra: string; dec: string; fov: number };
 type ViewMode = 'normal' | 'medsub' | 'mean';
@@ -57,34 +58,57 @@ const TICK_COLOR: Record<Status, string> = {
 };
 
 // Miniatura desenhada a partir do mesmo dado alinhado do vídeo
+// Miniatura desenhada a partir do mesmo dado alinhado do vídeo
 function Thumb({ loaded, gain }: { loaded: Loaded; gain: number }) {
   const ref = useRef<HTMLCanvasElement | null>(null);
+
   useEffect(() => {
     const cv = ref.current;
     if (!cv) return;
+
     const img = renderImage(loaded.data, loaded.n, loaded.n, gain);
     if (!img) return;
+
     cv.width = loaded.n;
     cv.height = loaded.n;
-    cv.getContext('2d')?.putImageData(img, 0, 0);
+
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+
+    ctx.putImageData(img, 0, 0);
   }, [loaded, gain]);
-  return <canvas ref={ref} className="w-full h-full object-cover" style={{ imageRendering: 'pixelated' }} />;
+
+  return (
+    <canvas
+      ref={ref}
+      className="w-full h-full object-contain block"
+      style={{ imageRendering: 'pixelated' }}
+    />
+  );
 }
 
 export default function TimelinePlayer({
   frames,
   center,
   active,
+  visible = true,
+  searching = false,
+  emptyMessage,
   selectedKey,
   onSelect,
 }: {
   frames: any[];
   center: Center;
-  active: boolean;
+  active: boolean; // baixar os frames (pode ser true mesmo com a aba escondida: pré-carrega)
+  visible?: boolean; // a aba está na tela
+  searching?: boolean; // a busca de observações está em andamento
+  emptyMessage?: string;
   selectedKey: string | null;
   onSelect: (key: string) => void;
 }) {
   const version = useFrameStore();
+  const pr = progress();
+  const searchSecs = useElapsed(searching);
 
   const [det, setDet] = useState('');
   const [playing, setPlaying] = useState(false);
@@ -93,7 +117,7 @@ export default function TimelinePlayer({
   const [gain, setGain] = useState(10);
   const [zoom, setZoom] = useState(1);
   const [minValid, setMinValid] = useState(60); // % mínima de pixels com dado para o frame entrar no vídeo
-  const [autoCrop, setAutoCrop] = useState(true);
+  const [autoCrop, setAutoCrop] = useState(false);
   const [showMark, setShowMark] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [exportPct, setExportPct] = useState(0);
@@ -146,11 +170,16 @@ export default function TimelinePlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKey]);
 
+  // Escondida: para o play
+  useEffect(() => {
+    if (!visible) setPlaying(false);
+  }, [visible]);
+
   const list = useMemo(() => sortByTime(frames.filter((f) => detOf(f) === det)), [frames, det]);
   const summary = useMemo(() => summarize(list), [list]);
   const listKey = useMemo(() => list.map(keyOf).join('\n'), [list]);
 
-  // Pede ao armazém os frames do detector atual, em ordem de data (só com a aba ativa)
+  // Pede ao armazém os frames do detector atual (ele baixa em ordem espalhada no tempo)
   useEffect(() => {
     setTarget({ ra: center.ra, dec: center.dec, fov: center.fov });
     want(active ? list.map(keyOf) : []);
@@ -293,15 +322,13 @@ export default function TimelinePlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curKey, mode, gain, ready, stack, crop, showMark]);
 
-  // Mantém a miniatura atual visível na faixa
+  // Mantém a miniatura atual visível na faixa (só com a aba na tela)
   useEffect(() => {
-    if (!active) return;
+    if (!visible) return;
     const i = list.findIndex((f) => keyOf(f) === curKey);
     if (i < 0) return;
-    stripRef.current
-      ?.querySelector(`[data-i="${i}"]`)
-      ?.scrollIntoView({ block: 'nearest', inline: 'center' });
-  }, [curKey, active, list]);
+    stripRef.current?.querySelector(`[data-i="${i}"]`)?.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }, [curKey, visible, list]);
 
   // Exporta: vídeo .webm (ou PNG na visão "Empilhada")
   const exportMedia = async () => {
@@ -392,8 +419,7 @@ export default function TimelinePlayer({
   }, [list, summary]);
 
   const pick = (f: any) => {
-    const s = statusOf(f);
-    if (s !== 'ok') return; // só frames já prontos e com cobertura suficiente
+    if (statusOf(f) !== 'ok') return; // só frames já prontos e com cobertura suficiente
     setPlaying(false);
     onSelect(keyOf(f));
   };
@@ -402,12 +428,19 @@ export default function TimelinePlayer({
     onSelect(keyOf(ready[Math.max(0, Math.min(ready.length - 1, i))]));
   };
 
+  const eta =
+    pr.finished >= 2 && pr.pending > 0
+      ? `falta ${fmtEta((pr.elapsedMs / pr.finished) * pr.pending)}`
+      : 'cada frame leva 10–25 s na IRSA';
+
   const sel = 'bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none';
   const aspect = crop ? crop.w / crop.h : 1;
   const sumText =
     summary.t0 !== null
       ? `${mjdToDate(summary.t0)} → ${mjdToDate(summary.t1!)} (${Math.round(summary.spanDays!)} dias) · ${summary.groups.length} período(s) de observação`
       : 'observações sem data na consulta';
+
+  const showLoadingPanel = !det || (list.length > 0 && st.pending > 0);
 
   return (
     <div className="absolute inset-0 flex flex-col bg-black">
@@ -455,7 +488,10 @@ export default function TimelinePlayer({
           <input type="range" min={0} max={100} step={5} value={minValid} onChange={(e) => setMinValid(+e.target.value)} />
           {minValid}%
         </label>
-        <label className="flex items-center gap-1 text-gray-400" title="Corta o vídeo na maior área que tem dado em todos os frames">
+        <label
+  className="flex items-center gap-1 text-gray-400"
+  title="Remove as bordas sem cobertura comum entre os frames. Desativado, mostra a grade completa."
+>
           <input type="checkbox" checked={autoCrop} onChange={(e) => setAutoCrop(e.target.checked)} />
           recorte automático
         </label>
@@ -488,20 +524,19 @@ export default function TimelinePlayer({
 
       {/* Imagem */}
       <div className="flex-1 min-h-0 relative overflow-hidden flex items-center justify-center">
-        {ready.length === 0 ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-xs text-gray-500 px-6 text-center">
-            {list.length === 0 ? (
-              'Nenhum frame deste detector para esse alvo.'
-            ) : st.low > 0 && st.pending === 0 ? (
-              <span>{st.low} frame(s) chegaram, mas todos têm cobertura abaixo de {minValid}%. Reduza a "cobertura mín.".</span>
-            ) : (
+        {frames.length === 0 ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-xs text-gray-400 px-6 text-center">
+            {searching ? (
               <>
-                <div className="h-8 w-8 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
-                <span>Alinhando frames... {st.pending} na fila (cada um leva 10–25 s na IRSA)</span>
+                <Radar size={64} />
+                <span>Buscando observações na IRSA… {searchSecs}s</span>
+                <span className="text-[11px] text-gray-600">pode levar até 30 s se a IRSA estiver lenta</span>
               </>
+            ) : (
+              <span className="max-w-lg leading-relaxed">{emptyMessage || 'Nenhuma observação para esse alvo.'}</span>
             )}
           </div>
-        ) : (
+        ) : ready.length > 0 ? (
           <div
             className="relative"
             style={{
@@ -514,6 +549,39 @@ export default function TimelinePlayer({
             }}
           >
             <canvas ref={canvasRef} className="w-full h-full" style={{ imageRendering: 'pixelated' }} />
+          </div>
+        ) : showLoadingPanel ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 px-6">
+            <Radar size={64} />
+            <Steps
+              items={[
+                { label: `${frames.length} observações encontradas · ${list.length} no detector ${det || '…'}`, state: 'done' },
+                { label: `Baixando e alinhando frames (${pr.done}/${pr.total})`, state: 'active' },
+                { label: 'Montando o vídeo', state: 'todo' },
+              ]}
+            />
+            <div className="w-72">
+              <Bar value={pr.total ? pr.done / pr.total : 0} indeterminate={pr.done === 0} />
+            </div>
+            <span className="text-[11px] text-gray-500">{eta}</span>
+          </div>
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500 px-6 text-center">
+            {list.length === 0
+              ? 'Nenhum frame deste detector para esse alvo.'
+              : st.low > 0 && st.pending === 0
+              ? `${st.low} frame(s) chegaram, mas todos têm cobertura abaixo de ${minValid}%. Reduza a "cobertura mín.".`
+              : `Nenhum frame deste detector ficou disponível: ${st.err} erro(s), ${st.nocov} sem cobertura. Tente outro detector${st.err ? ' ou use "Tentar de novo"' : ''}.`}
+          </div>
+        )}
+
+        {/* O vídeo já toca, mas ainda chegam frames */}
+        {ready.length > 0 && pr.pending > 0 && (
+          <div className="absolute left-2 bottom-2 z-10 w-60 bg-gray-900/90 border border-gray-700 rounded p-2 flex flex-col gap-1 pointer-events-none">
+            <span className="text-[10px] text-gray-300 font-mono">
+              Baixando mais frames: {pr.done}/{pr.total} · {eta}
+            </span>
+            <Bar value={pr.total ? pr.done / pr.total : 0} />
           </div>
         )}
 
@@ -611,19 +679,24 @@ export default function TimelinePlayer({
               onClick={() => pick(f)}
               className={`shrink-0 w-20 flex flex-col gap-0.5 p-0.5 rounded border ${
                 k === curKey ? 'border-blue-500 bg-gray-800' : 'border-gray-800 bg-gray-900'
-              } ${status === 'ok' ? 'cursor-pointer hover:border-gray-600' : 'opacity-70'}`}
+              } ${status === 'ok' ? 'cursor-pointer hover:border-gray-600' : 'opacity-80'}`}
             >
-              <div className="h-20 bg-black rounded overflow-hidden flex items-center justify-center">
+              <div className="h-20 bg-black rounded overflow-hidden flex items-center justify-center p-0.5">
                 {s?.status === 'ok' ? (
-                  <Thumb loaded={s.loaded!} gain={gain} />
-                ) : status === 'loading' ? (
-                  <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
+                  <div className="sx-fade w-full h-full">
+                    <Thumb loaded={s.loaded!} gain={gain} />
+                  </div>
                 ) : status === 'err' ? (
                   <span className="text-[9px] text-red-400">erro</span>
                 ) : status === 'nocov' ? (
                   <span className="text-[9px] text-gray-600">sem cob.</span>
                 ) : (
-                  <span className="text-[9px] text-gray-700">…</span>
+                  <div className="relative w-full h-full">
+                    <Skeleton className="absolute inset-0" />
+                    {status === 'loading' && (
+                      <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-4 w-4 rounded-full border-2 border-gray-600 border-t-blue-400 animate-spin" />
+                    )}
+                  </div>
                 )}
               </div>
               <div className="text-[9px] text-gray-400 font-mono truncate">{f.date || `#${i + 1}`}</div>

@@ -1,6 +1,8 @@
 'use client';
 import TimelinePlayer from './TimelinePlayer';
 import { parseCoords } from '../../lib/coords';
+import { FeedbackStyles, Radar, Bar, useElapsed, fmtEta } from './Feedback';
+import { useFrameStore, progress } from '../../lib/frameStore';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -60,6 +62,21 @@ const CHALLENGE_TARGETS = [
 
 // "Campo" = tamanho do recorte dos frames (graus). O mapa mostra 3x esse valor.
 const FOV_OPTIONS = [0.08, 0.16, 0.24, 0.4];
+const FOV_MIN = 0.04; // limites do campo desenhado (graus)
+const FOV_MAX = 0.6;
+
+// Distância angular entre dois pontos do céu (graus)
+const sepDeg = (ra1: number, dec1: number, ra2: number, dec2: number) => {
+  const r = Math.PI / 180;
+  const a = Math.sin(((dec2 - dec1) * r) / 2) ** 2 + Math.cos(dec1 * r) * Math.cos(dec2 * r) * Math.sin(((ra2 - ra1) * r) / 2) ** 2;
+  return ((2 * Math.asin(Math.min(1, Math.sqrt(a)))) / r);
+};
+
+// Texto curto do "porquê" da busca (fonte + linhas brutas/filtradas + erro)
+const noteFrom = (dbg: any): string => {
+  const info = (dbg?.attempts || []).find((a: any) => a.status === 'info');
+  return [dbg?.source ? `Fonte: ${dbg.source}` : '', info?.note || '', dbg?.error || ''].filter(Boolean).join(' · ');
+};
 const MAP_FOV_FACTOR = 3;
 const SEARCH_RADIUS = 0.05;
 const MAX_PARALLEL = 4;
@@ -154,8 +171,12 @@ function setSurvey(aladin: any, A: any, url: string, onError: (m: string) => voi
 }
 export default function SkyMap() {
   const [ra, setRa] = useState('269.452075');
-  const [picked, setPicked] = useState<{ ra: number; dec: number } | null>(null);
-  const [dec, setDec] = useState('4.693391');
+const [picked, setPicked] = useState<{ ra: number; dec: number; fov: number } | null>(null);
+const [drawMode, setDrawMode] = useState(false);
+const [drawing, setDrawing] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+const [searchNote, setSearchNote] = useState('');
+useFrameStore(); // re-renderiza quando chega um frame
+const prog = progress();
   const [fov, setFov] = useState(0.24);
   const [band, setBand] = useState('color');
   const [mode, setMode] = useState<Mode>('map');
@@ -171,6 +192,8 @@ export default function SkyMap() {
   const [view, setView] = useState<View>({ s: 1, x: 0, y: 0 });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [showLog, setShowLog] = useState(true);
+  const searchSecs = useElapsed(phase === 'searching');  const [dec, setDec] = useState('4.693391');
+
 
   const runRef = useRef(0);
   const centerRef = useRef<Center>(center);
@@ -189,8 +212,13 @@ const tilesRef = useRef<Record<string, TileState>>({});
   const aRef = useRef<any>(null);
   const overlayRef = useRef<any>(null);
   const pausedRef = useRef(false);
+  const fovRef = useRef(fov);
+const drawRef = useRef<{ x0: number; y0: number } | null>(null);
+const mapBoxRef = useRef<HTMLDivElement | null>(null);
+const pickOverlayRef = useRef<any>(null);
 
     tilesRef.current = tiles;
+    fovRef.current = fov;
 
 
   const addLog = useCallback((level: LogLevel, text: string) => {
@@ -230,6 +258,27 @@ const tilesRef = useRef<Record<string, TileState>>({});
     [addLog]
   );
 
+  // Círculo ciano = área escolhida pelo usuário (f = null apaga)
+const showPick = useCallback(
+  (r: number, d: number, f: number | null) => {
+    const al = aladinRef.current;
+    const A = aRef.current;
+    if (!al || !A) return;
+    try {
+      if (!pickOverlayRef.current) {
+        pickOverlayRef.current = A.graphicOverlay({ color: '#22d3ee', lineWidth: 2 });
+        al.addOverlay(pickOverlayRef.current);
+      } else {
+        pickOverlayRef.current.removeAll();
+      }
+      if (f !== null) pickOverlayRef.current.add(A.circle(r, d, f / 2));
+    } catch (e: any) {
+      addLog('warn', `Aladin (marcar área): ${e?.message || e}`);
+    }
+  },
+  [addLog]
+);
+
   const initAladin = useCallback(
     (isCancelled: () => boolean = () => false) => {
       setMapState('loading');
@@ -254,11 +303,12 @@ const bandUrl = surveyUrl(bandRef.current);
           });
 
           moveMap(c);
-          aladinRef.current.on('click', (e: any) => {
-  if (e?.isDragging) return; // arraste não conta como clique
+aladinRef.current.on('click', (e: any) => {
+  if (e?.isDragging) return;
   if (!Number.isFinite(e?.ra) || !Number.isFinite(e?.dec)) return;
   addLog('info', `Clique no mapa: RA ${e.ra.toFixed(5)}, Dec ${e.dec.toFixed(5)}`);
-  setPicked({ ra: e.ra, dec: e.dec });
+  setPicked({ ra: e.ra, dec: e.dec, fov: fovRef.current });
+  showPick(e.ra, e.dec, fovRef.current);
 });
           setMapState('ready');
           setMapMsg('Mapa pronto');
@@ -410,6 +460,8 @@ const cancelQueued = (key: string) => {
     centerRef.current = c;
     setCenter(c);
     moveMap(c); // o mapa vai para o alvo na hora, sem esperar a IRSA
+    showPick(0, 0, null);
+setSearchNote('');
 
     setFrames([]);
     setTiles({});
@@ -430,6 +482,7 @@ const cancelQueued = (key: string) => {
       if (runId !== runRef.current) return;
 
       const dbg = data?.debug;
+      setSearchNote(noteFrom(dbg));
       if (dbg) {
         addLog('info', `Servidor: ${dbg.source}${dbg.stale ? ' (DADOS ANTIGOS)' : ''} em ${dbg.elapsedMs}ms`);
         (dbg.attempts || []).forEach((a: any) =>
@@ -521,6 +574,64 @@ const cancelQueued = (key: string) => {
     });
   };
 
+  // ---- Desenhar área no mapa: clique no centro e arraste até a borda ----
+const pixToSky = (x: number, y: number): [number, number] | null => {
+  try {
+    const r = aladinRef.current?.pix2world(x, y);
+    if (r && Number.isFinite(r[0]) && Number.isFinite(r[1])) return [r[0], r[1]];
+  } catch {}
+  return null;
+};
+const relPos = (e: React.PointerEvent) => {
+  const r = mapBoxRef.current?.getBoundingClientRect();
+  return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
+};
+const onDrawDown = (e: React.PointerEvent<HTMLDivElement>) => {
+  e.currentTarget.setPointerCapture(e.pointerId);
+  const p = relPos(e);
+  drawRef.current = { x0: p.x, y0: p.y };
+  setDrawing({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+};
+const onDrawMove = (e: React.PointerEvent<HTMLDivElement>) => {
+  const d = drawRef.current;
+  if (!d) return;
+  const p = relPos(e);
+  setDrawing({ x0: d.x0, y0: d.y0, x1: p.x, y1: p.y });
+};
+const onDrawUp = (e: React.PointerEvent<HTMLDivElement>) => {
+  const d = drawRef.current;
+  drawRef.current = null;
+  setDrawing(null);
+  if (!d) return;
+  const p = relPos(e);
+  const c = pixToSky(d.x0, d.y0);
+  if (!c) {
+    addLog('warn', 'Não consegui converter o ponto da tela em coordenadas (pix2world).');
+    return;
+  }
+  let f = fov; // clique sem arrastar: usa o campo atual
+  if (Math.hypot(p.x - d.x0, p.y - d.y0) >= 8) {
+    const edge = pixToSky(p.x, p.y);
+    if (edge) f = Math.min(FOV_MAX, Math.max(FOV_MIN, Math.round(2 * sepDeg(c[0], c[1], edge[0], edge[1]) * 1000) / 1000));
+  }
+  addLog('info', `Área desenhada: RA ${c[0].toFixed(5)}, Dec ${c[1].toFixed(5)}, campo ${f}°`);
+  setPicked({ ra: c[0], dec: c[1], fov: f });
+  showPick(c[0], c[1], f);
+  setDrawMode(false);
+};
+useEffect(() => {
+  if (!drawMode) return;
+  const h = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      drawRef.current = null;
+      setDrawing(null);
+      setDrawMode(false);
+    }
+  };
+  window.addEventListener('keydown', h);
+  return () => window.removeEventListener('keydown', h);
+}, [drawMode]);
+
   // ---- Zoom e arraste do visualizador de frame ----
   const zoomAt = (factor: number, cx: number, cy: number) => {
     setView((v) => {
@@ -590,6 +701,7 @@ else
 
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-white overflow-hidden">
+      <FeedbackStyles />
       {/* Topo */}
       <header className="flex flex-wrap items-center justify-between gap-4 p-3 bg-gray-900 border-b border-gray-800 shadow-md">
         <div className="flex items-center gap-3">
@@ -619,11 +731,11 @@ else
           <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
             <span className="text-[10px] text-gray-400">Campo:</span>
             <select value={fov} onChange={(e) => setFov(parseFloat(e.target.value))} className="bg-transparent text-white text-xs outline-none">
-              {FOV_OPTIONS.map((o) => (
-                <option key={o} value={o} className="bg-gray-900">
-                  {o}°
-                </option>
-              ))}
+              {(FOV_OPTIONS.includes(fov) ? FOV_OPTIONS : [...FOV_OPTIONS, fov].sort((a, b) => a - b)).map((o) => (
+  <option key={o} value={o} className="bg-gray-900">
+    {o}°{FOV_OPTIONS.includes(o) ? '' : ' (desenhado)'}
+  </option>
+))}
             </select>
           </div>
           <button type="submit" disabled={loading} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-60 px-4 py-1 rounded text-xs font-medium transition">
@@ -665,15 +777,27 @@ else
 
               <button
   onClick={() => setMode('video')}
-  disabled={frames.length === 0}
   className={`px-3 py-1 transition disabled:opacity-40 ${mode === 'video' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
 >
-  🎬 Linha do tempo{frames.length ? ` · ${frames.length} obs.` : ''}
+ 🎬 Linha do tempo{prog.total > 0 ? ` · ${prog.done}/${prog.total}` : ''}
+{prog.pending > 0 && (
+  <span className="ml-1.5 inline-block h-2.5 w-2.5 rounded-full border-2 border-white/40 border-t-white animate-spin align-middle" />
+)}
 </button>
             </div>
 
             <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
               <span className="text-[10px] text-gray-400">Fundo do mapa:</span>
+              <button
+  onClick={() => { setMode('map'); setDrawMode((d) => !d); }}
+  disabled={mapState !== 'ready'}
+  className={`px-3 py-1 rounded border text-xs transition disabled:opacity-40 ${
+    drawMode ? 'bg-cyan-600 border-cyan-400 text-white' : 'bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700'
+  }`}
+  title="Clique no centro da área e arraste até a borda"
+>
+  ⭕ Desenhar área
+</button>
               <select value={band} onChange={(e) => setBand(e.target.value)} className="bg-transparent text-white text-xs outline-none">
                 {SURVEYS.map((b) => (
                   <option key={b.id} value={b.id} className="bg-gray-900">
@@ -703,9 +827,36 @@ else
           <div className="flex-1 min-h-0 relative bg-black rounded-lg border border-gray-800 overflow-hidden">
             {/* Mapa Aladin */}
             <div className={`absolute inset-0 ${mode === 'map' ? '' : 'invisible pointer-events-none'}`}>
-              <div className="absolute inset-0">
+              <div ref={mapBoxRef} className="absolute inset-0">
   <div id="aladin-lite-div" style={{ width: '100%', height: '100%' }} />
 </div>
+{drawMode && (
+  <div
+    className="absolute inset-0 z-20 cursor-crosshair touch-none select-none"
+    onPointerDown={onDrawDown}
+    onPointerMove={onDrawMove}
+    onPointerUp={onDrawUp}
+    onPointerCancel={() => { drawRef.current = null; setDrawing(null); }}
+  >
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-gray-900/90 border border-cyan-700 text-cyan-200 text-xs px-3 py-1.5 rounded-full pointer-events-none">
+      Clique no centro e arraste até a borda · Esc cancela
+    </div>
+    {drawing && (
+      <svg className="absolute inset-0 w-full h-full pointer-events-none">
+        <circle
+          cx={drawing.x0}
+          cy={drawing.y0}
+          r={Math.hypot(drawing.x1 - drawing.x0, drawing.y1 - drawing.y0)}
+          fill="rgba(34,211,238,0.12)"
+          stroke="#22d3ee"
+          strokeWidth={2}
+          strokeDasharray="6 4"
+        />
+        <line x1={drawing.x0} y1={drawing.y0} x2={drawing.x1} y2={drawing.y1} stroke="#22d3ee" strokeWidth={1} />
+      </svg>
+    )}
+  </div>
+)}
               {mapState !== 'ready' && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-center px-6 z-10">
                   {mapState === 'loading' ? (
@@ -729,11 +880,10 @@ else
     onClick={() => setMode('video')}
     className="absolute bottom-3 right-3 z-10 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium px-4 py-2 rounded-full shadow"
   >
-    {picked && (
-  <div className="absolute top-3 left-3 z-10 bg-gray-900/95 border border-gray-700 rounded p-3 text-xs flex flex-col gap-2">
-    <span className="font-mono text-gray-200">
-      RA {picked.ra.toFixed(5)} · Dec {picked.dec.toFixed(5)}
-    </span>
+  {picked && (
+  <div className="absolute top-3 left-3 z-10 bg-gray-900/95 border border-cyan-800 rounded p-3 text-xs flex flex-col gap-2">
+    <span className="font-mono text-gray-200">RA {picked.ra.toFixed(5)} · Dec {picked.dec.toFixed(5)}</span>
+    <span className="text-gray-400">Raio {((picked.fov / 2) * 60).toFixed(1)}′ · recorte de {picked.fov}°</span>
     <div className="flex gap-2">
       <button
         onClick={() => {
@@ -741,24 +891,25 @@ else
           const d = picked.dec.toFixed(6);
           setRa(r);
           setDec(d);
-          fetchData(r, d, fov);
+          setFov(picked.fov);
+          fetchData(r, d, picked.fov);
         }}
         className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1 rounded"
       >
         Gerar linha do tempo aqui
       </button>
-      <button onClick={() => setPicked(null)} className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded">
+      <button onClick={() => { setPicked(null); showPick(0, 0, null); }} className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded">
         cancelar
       </button>
     </div>
   </div>
 )}
-    ▶ Ver como esse pedaço do céu muda no tempo
-  </button>
+▶ Ver como esse pedaço do céu muda no tempo{prog.total > 0 ? ` (${prog.done}/${prog.total} prontos)` : ''}  </button>
 )}
               {mapState === 'ready' && (
-                <div className="absolute bottom-2 left-3 text-[10px] text-gray-300 font-mono pointer-events-none z-10 drop-shadow">
-Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames                </div>
+            <div className="absolute top-3 right-3 max-w-xs text-right text-[10px] text-gray-300 font-mono pointer-events-none z-10 drop-shadow bg-gray-950/70 rounded px-2 py-1">
+  Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames
+</div>
               )}
             </div>
 
@@ -820,11 +971,34 @@ Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames            
               <TimelinePlayer
   frames={frames}
   center={center}
-  active={mode === 'video'}
+  active={frames.length > 0}
+  visible={mode === 'video'}
+  searching={phase === 'searching'}
+  emptyMessage={
+    phase === 'error'
+      ? statusMsg
+      : `Nenhuma observação encontrada para essa coordenada.${searchNote ? ' ' + searchNote : ''}`
+  }
   selectedKey={selectedKey}
   onSelect={(k) => { userPickedRef.current = true; setSelectedKey(k); }}
 />
             </div>
+            {phase === 'searching' && (
+  <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/50 text-center px-6 pointer-events-none">
+    <Radar size={72} />
+    <span className="text-sm text-gray-200">Buscando observações do SPHEREx para esse ponto…</span>
+    <span className="text-[11px] text-gray-400 font-mono">{searchSecs}s · consultando a IRSA (até 30 s se estiver lenta)</span>
+  </div>
+)}
+{mode !== 'video' && frames.length > 0 && prog.pending > 0 && (
+  <div className="absolute top-3 right-3 z-20 w-60 bg-gray-900/95 border border-gray-700 rounded p-2.5 flex flex-col gap-1.5">
+    <span className="text-[11px] text-gray-200">Preparando a linha do tempo… {prog.done}/{prog.total}</span>
+    <Bar value={prog.total ? prog.done / prog.total : 0} />
+    <span className="text-[10px] text-gray-500">
+      {prog.finished >= 2 ? `falta ${fmtEta((prog.elapsedMs / prog.finished) * prog.pending)}` : 'cada frame leva 10–25 s'}
+    </span>
+  </div>
+)}
           </div>
 
           {/* Faixa de frames: cada thumbnail só baixa quando se aproxima da área visível */}
