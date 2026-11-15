@@ -1,47 +1,9 @@
 // app/api/fits-to-png/route.ts
 import { NextResponse } from 'next/server';
 import { PNG } from 'pngjs';
+import { acquire, release, fetchBuffer } from '../../../lib/irsa';
 
 type Hdu = { header: Record<string, string>; dataStart: number };
-
-// ---- Limita pedidos simultâneos à IRSA ----
-const MAX_CONCURRENT = 3;
-let active = 0;
-const waiting: (() => void)[] = [];
-
-async function acquire() {
-  if (active < MAX_CONCURRENT) {
-    active++;
-    return;
-  }
-  await new Promise<void>((resolve) => waiting.push(resolve));
-  active++;
-}
-
-function release() {
-  active--;
-  const next = waiting.shift();
-  if (next) next();
-}
-
-// ---- Fetch com retry (só repete 429, 5xx e falhas de rede) ----
-async function fetchWithRetry(url: string, tries = 3) {
-  let lastStatus = 0;
-  for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(40000) });
-      if (res.ok) return res;
-      lastStatus = res.status;
-      if (res.status < 500 && res.status !== 429) break; // 422 etc: não adianta repetir
-    } catch {
-      lastStatus = 0; // timeout ou rede
-    }
-    await new Promise((r) => setTimeout(r, 800 * (i + 1)));
-  }
-  const err: any = new Error(`Erro no cutout IRSA: ${lastStatus || 'timeout/rede'}`);
-  err.status = lastStatus;
-  throw err;
-}
 
 // ---- Parser de FITS (MEF) ----
 function parseHdus(buf: Buffer): Hdu[] {
@@ -80,14 +42,22 @@ function parseHdus(buf: Buffer): Hdu[] {
 }
 
 export async function GET(request: Request) {
+  const signal = request.signal; // aborta quando o navegador cancela
   const { searchParams } = new URL(request.url);
   const fitsUrl = searchParams.get('url');
   if (!fitsUrl) return NextResponse.json({ error: 'URL não fornecida' }, { status: 400 });
+  if (!fitsUrl.startsWith('https://irsa.ipac.caltech.edu/ibe/data/spherex/')) {
+    return NextResponse.json({ error: 'URL fora do arquivo SPHEREx' }, { status: 400 });
+  }
 
-  await acquire();
   try {
-    const response = await fetchWithRetry(fitsUrl);
-    const buffer = Buffer.from(await response.arrayBuffer());
+    await acquire(signal);
+  } catch {
+    return new NextResponse(null, { status: 499 }); // cancelado na fila
+  }
+
+  try {
+    const buffer = await fetchBuffer(fitsUrl, { signal, tries: 2, timeoutMs: 45000 });
 
     const hdus = parseHdus(buffer);
     const img =
@@ -135,11 +105,9 @@ export async function GET(request: Request) {
       headers: { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' },
     });
   } catch (error: any) {
+    if (signal.aborted) return new NextResponse(null, { status: 499 });
     console.error('Erro ao processar cutout:', error.message);
-    return NextResponse.json(
-      { error: error.message },
-      { status: error.status === 422 ? 422 : 502 }
-    );
+    return NextResponse.json({ error: error.message }, { status: error.status === 422 ? 422 : 502 });
   } finally {
     release();
   }

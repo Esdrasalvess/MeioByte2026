@@ -1,5 +1,5 @@
-// src/app/components/SkyMap.tsx
 'use client';
+import TimelinePlayer from './TimelinePlayer';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -7,6 +7,46 @@ declare global {
   interface Window {
     A?: any;
   }
+}
+
+// Célula que avisa quando entra/sai da área visível da faixa (com folga de ~3 thumbnails)
+function LazyCell({
+  rootRef,
+  onEnter,
+  onLeave,
+  onClick,
+  className,
+  children,
+}: {
+  rootRef: React.RefObject<HTMLDivElement | null>;
+  onEnter: () => void;
+  onLeave: () => void;
+  onClick: () => void;
+  className: string;
+  children: React.ReactNode;
+}) {
+  const elRef = useRef<HTMLDivElement | null>(null);
+  const cb = useRef({ onEnter, onLeave });
+  cb.current = { onEnter, onLeave }; // sempre a versão mais nova, sem recriar o observer
+
+  useEffect(() => {
+    const el = elRef.current;
+    const root = rootRef.current;
+    if (!el || !root) return;
+    const io = new IntersectionObserver(
+      ([e]) => (e.isIntersecting ? cb.current.onEnter() : cb.current.onLeave()),
+      { root, rootMargin: '0px 320px 0px 320px', threshold: 0 }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div ref={elRef} onClick={onClick} className={className}>
+      {children}
+    </div>
+  );
 }
 
 const CHALLENGE_TARGETS = [
@@ -36,7 +76,7 @@ type LogLevel = 'info' | 'ok' | 'warn' | 'error';
 type LogEntry = { t: string; level: LogLevel; text: string };
 type Phase = 'idle' | 'searching' | 'rendering' | 'done' | 'error';
 type MapState = 'loading' | 'ready' | 'error';
-type Mode = 'map' | 'frame';
+type Mode = 'map' | 'frame' | 'video';
 
 const frameKey = (f: any): string => f?.access_url || f?.accessUrl || f?.url || f?.fileUrl || '';
 const shortName = (key: string) => (key.split('?')[0].split('/').pop() || key).slice(-34);
@@ -133,7 +173,9 @@ export default function SkyMap() {
   const runRef = useRef(0);
   const centerRef = useRef<Center>(center);
   const bandRef = useRef(band);
-  const queueRef = useRef<(() => Promise<void>)[]>([]);
+const queueRef = useRef<{ key: string; run: () => Promise<void> }[]>([]);
+const stripRef = useRef<HTMLDivElement | null>(null);
+const tilesRef = useRef<Record<string, TileState>>({});
   const activeRef = useRef(0);
   const blobUrlsRef = useRef<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -144,6 +186,10 @@ export default function SkyMap() {
   const aladinRef = useRef<any>(null);
   const aRef = useRef<any>(null);
   const overlayRef = useRef<any>(null);
+  const pausedRef = useRef(false);
+
+    tilesRef.current = tiles;
+
 
   const addLog = useCallback((level: LogLevel, text: string) => {
     const t = new Date().toLocaleTimeString('pt-BR');
@@ -249,25 +295,27 @@ useEffect(() => {
   }, []);
 
   const pump = useCallback(() => {
-    while (activeRef.current < MAX_PARALLEL && queueRef.current.length > 0) {
-      const job = queueRef.current.shift()!;
-      activeRef.current++;
-      job().finally(() => {
-        activeRef.current--;
-        pump();
-      });
+  while (!pausedRef.current && activeRef.current < MAX_PARALLEL && queueRef.current.length > 0) {
+    const item = queueRef.current.shift()!;
+    activeRef.current++;
+    item.run().finally(() => {
+      activeRef.current--;
+      pump();
+    });
+  }
+}, []);
+
+const loadTile = useCallback(
+  (key: string, url: string, runId: number) => {
+    if (!url) {
+      setTile(key, { status: 'error', message: 'Sem URL' });
+      return;
     }
-  }, []);
+    setTile(key, { status: 'loading' });
 
-  const loadTile = useCallback(
-    (key: string, url: string, runId: number) => {
-      if (!url) {
-        setTile(key, { status: 'error', message: 'Sem URL' });
-        return;
-      }
-      setTile(key, { status: 'loading' });
-
-      queueRef.current.push(async () => {
+    queueRef.current.push({
+      key,
+      run: async () => {
         if (runId !== runRef.current) return;
         const signal = abortRef.current?.signal;
         const t0 = Date.now();
@@ -281,6 +329,7 @@ useEffect(() => {
             addLog('info', `${shortName(key)}: sem cobertura (${secs}s)`);
             return;
           }
+          if (res.status === 499) return;
           if (!res.ok) {
             let detail = `HTTP ${res.status}`;
             try {
@@ -302,12 +351,33 @@ useEffect(() => {
           setTile(key, { status: 'error', message: msg });
           addLog('error', `${shortName(key)}: ${msg}`);
         }
-      });
+      },
+    });
 
-      pump();
-    },
-    [pump, setTile, addLog]
-  );
+    pump();
+  },
+  [pump, setTile, addLog]
+);
+
+// Pedido pela visibilidade: só enfileira se ainda não foi pedido
+const enterTile = (frame: any) => {
+  const key = frameKey(frame);
+  if (tilesRef.current[key]) return;
+  if (queueRef.current.some((q) => q.key === key)) return;
+  loadTile(key, buildPngUrl(frame, centerRef.current), runRef.current);
+};
+
+// Saiu da tela e ainda não começou a baixar: tira da fila
+const cancelQueued = (key: string) => {
+  const i = queueRef.current.findIndex((q) => q.key === key);
+  if (i < 0) return; // já está baixando ou pronto: deixa terminar
+  queueRef.current.splice(i, 1);
+  setTiles((prev) => {
+    const next = { ...prev };
+    delete next[key];
+    return next;
+  });
+};
 
   const fetchData = async (targetRa: string, targetDec: string, targetFov: number) => {
     const runId = ++runRef.current;
@@ -463,27 +533,30 @@ useEffect(() => {
     dragRef.current = null;
   };
 
-  // ---- Contadores e estado geral ----
-  const counts = { loading: 0, ok: 0, nocoverage: 0, error: 0 };
-  frames.forEach((f) => {
-    counts[tiles[frameKey(f)]?.status || 'loading']++;
-  });
-  const done = counts.ok + counts.nocoverage + counts.error;
-  const allDone = frames.length > 0 && done === frames.length;
+// ---- Contadores e estado geral ----
+const requested = frames.filter((f) => tiles[frameKey(f)]);
+const counts = { loading: 0, ok: 0, nocoverage: 0, error: 0 };
+requested.forEach((f) => {
+  counts[tiles[frameKey(f)].status]++;
+});
+const done = counts.ok + counts.nocoverage + counts.error;
+const allDone = requested.length > 0 && done === requested.length;
 
-  let banner: { color: string; text: string };
-  if (phase === 'searching') banner = { color: 'bg-blue-900/40 border-blue-700 text-blue-200', text: '⏳ ' + statusMsg };
-  else if (phase === 'error') banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ ' + statusMsg };
-  else if (phase === 'rendering' && !allDone)
-    banner = { color: 'bg-blue-900/40 border-blue-700 text-blue-200', text: `⏳ Baixando recortes: ${done}/${frames.length}` };
-  else if (allDone && counts.ok === 0)
-    banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ Nenhum recorte funcionou. Veja o log.' };
-  else if (allDone && counts.error > 0)
-    banner = { color: 'bg-yellow-900/40 border-yellow-700 text-yellow-200', text: `⚠️ ${counts.ok} ok, mas ${counts.error} falharam.` };
-  else if (allDone)
-    banner = { color: 'bg-green-900/40 border-green-700 text-green-200', text: `✅ ${counts.ok} frames carregados (${counts.nocoverage} sem cobertura).` };
-  else banner = { color: 'bg-gray-800 border-gray-700 text-gray-300', text: statusMsg || 'Pronto.' };
-
+let banner: { color: string; text: string };
+const blue = 'bg-blue-900/40 border-blue-700 text-blue-200';
+if (phase === 'searching') banner = { color: blue, text: '⏳ ' + statusMsg };
+else if (phase === 'error') banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ ' + statusMsg };
+else if (frames.length === 0) banner = { color: 'bg-gray-800 border-gray-700 text-gray-300', text: statusMsg || 'Pronto.' };
+else if (requested.length === 0)
+  banner = { color: blue, text: `${frames.length} observações encontradas. Os recortes baixam conforme aparecem na faixa.` };
+else if (!allDone)
+  banner = { color: blue, text: `⏳ Baixando os recortes visíveis: ${done}/${requested.length} (de ${frames.length})` };
+else if (counts.ok === 0)
+  banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ Nenhum recorte funcionou. Veja o log.' };
+else if (counts.error > 0)
+  banner = { color: 'bg-yellow-900/40 border-yellow-700 text-yellow-200', text: `⚠️ ${counts.ok} ok, mas ${counts.error} falharam.` };
+else
+  banner = { color: 'bg-green-900/40 border-green-700 text-green-200', text: `✅ ${counts.ok} de ${frames.length} recortes carregados (${counts.nocoverage} sem cobertura). Role a faixa para ver mais.` };
   const loading = phase === 'searching';
   const selectedFrame = frames.find((f) => frameKey(f) === selectedKey) || null;
   const selectedTile = selectedKey ? tiles[selectedKey] : undefined;
@@ -577,6 +650,13 @@ useEffect(() => {
               >
                 🎞️ Frame individual
               </button>
+              <button
+  onClick={() => setMode('video')}
+  disabled={frames.length === 0}
+  className={`px-3 py-1 transition disabled:opacity-40 ${mode === 'video' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
+>
+  🎬 Linha do tempo
+</button>
             </div>
 
             <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
@@ -600,11 +680,11 @@ useEffect(() => {
             )}
           </div>
 
-          {frames.length > 0 && !allDone && (
-            <div className="h-1.5 w-full bg-gray-800 rounded overflow-hidden">
-              <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${(done / frames.length) * 100}%` }} />
-            </div>
-          )}
+          {requested.length > 0 && !allDone && (
+  <div className="h-1.5 w-full bg-gray-800 rounded overflow-hidden">
+    <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${(done / requested.length) * 100}%` }} />
+  </div>
+)}
 
           {/* Área do visualizador: mapa Aladin e frame ficam montados, só alterna a visibilidade */}
           <div className="flex-1 min-h-0 relative bg-black rounded-lg border border-gray-800 overflow-hidden">
@@ -691,50 +771,57 @@ Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames            
                 zoom {view.s.toFixed(1)}x · roda do mouse = zoom · arraste = mover · círculo = alvo
               </div>
             </div>
-          </div>
-
-          {/* Faixa de frames */}
-          <div className="h-28 shrink-0 overflow-x-auto overflow-y-hidden">
-            <div className="flex gap-2 h-full">
-              {stripFrames.map((frame) => {
-                const key = frameKey(frame);
-                const tile = tiles[key] || { status: 'loading' as TileStatus };
-                const isSelected = selectedKey === key && mode === 'frame';
-                const idx = frames.indexOf(frame);
-
-                return (
-                  <div
-                    key={key}
-                    onClick={() => pickFrame(key)}
-                    className={`shrink-0 w-24 flex flex-col gap-1 p-1 rounded border cursor-pointer transition ${
-                      isSelected ? 'border-blue-500 bg-gray-800' : 'border-gray-800 bg-gray-900 hover:border-gray-600'
-                    }`}
-                  >
-                    <div className="flex-1 min-h-0 bg-black rounded overflow-hidden flex items-center justify-center">
-                      {tile.status === 'ok' && tile.src && (
-                        <img src={tile.src} alt={`Frame ${idx + 1}`} draggable={false} className="w-full h-full object-cover" style={{ imageRendering: 'pixelated' }} />
-                      )}
-                      {tile.status === 'loading' && <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />}
-                      {tile.status === 'error' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            retryTile(frame);
-                          }}
-                          className="text-[10px] text-red-400 hover:text-red-300"
-                        >
-                          ↻ erro
-                        </button>
-                      )}
-                    </div>
-                    <div className="text-[9px] text-gray-400 font-mono truncate">
-                      #{idx + 1} · {frame.date || frame.energy_bandpassname || 'IR'}
-                    </div>
-                  </div>
-                );
-              })}
+            <div className={`absolute inset-0 ${mode === 'video' ? '' : 'invisible pointer-events-none'}`}>
+              <TimelinePlayer frames={frames} center={center} active={mode === 'video'} />
             </div>
           </div>
+
+          {/* Faixa de frames: cada thumbnail só baixa quando se aproxima da área visível */}
+<div ref={stripRef} className="h-28 shrink-0 overflow-x-auto overflow-y-hidden">
+  <div className="flex gap-2 h-full">
+    {stripFrames.map((frame) => {
+      const key = frameKey(frame);
+      const tile = tiles[key];
+      const isSelected = selectedKey === key && mode === 'frame';
+      const idx = frames.indexOf(frame);
+
+      return (
+        <LazyCell
+          key={key}
+          rootRef={stripRef}
+          onEnter={() => enterTile(frame)}
+          onLeave={() => cancelQueued(key)}
+          onClick={() => pickFrame(key)}
+          className={`shrink-0 w-24 flex flex-col gap-1 p-1 rounded border cursor-pointer transition ${
+            isSelected ? 'border-blue-500 bg-gray-800' : 'border-gray-800 bg-gray-900 hover:border-gray-600'
+          }`}
+        >
+          <div className="flex-1 min-h-0 bg-black rounded overflow-hidden flex items-center justify-center">
+            {tile?.status === 'ok' && tile.src && (
+              <img src={tile.src} alt={`Frame ${idx + 1}`} draggable={false} decoding="async" className="w-full h-full object-cover" style={{ imageRendering: 'pixelated' }} />
+            )}
+            {tile?.status === 'loading' && <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />}
+            {!tile && <span className="text-[9px] text-gray-700">…</span>}
+            {tile?.status === 'error' && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  retryTile(frame);
+                }}
+                className="text-[10px] text-red-400 hover:text-red-300"
+              >
+                ↻ erro
+              </button>
+            )}
+          </div>
+          <div className="text-[9px] text-gray-400 font-mono truncate">
+            #{idx + 1} · {frame.date || frame.energy_bandpassname || 'IR'}
+          </div>
+        </LazyCell>
+      );
+    })}
+  </div>
+</div>
         </main>
 
         {/* Painel lateral */}
