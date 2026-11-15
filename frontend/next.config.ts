@@ -1,7 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {
@@ -12,6 +11,9 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  async rewrites() {
+  return [{ source: '/hips/:path*', destination: 'https://alasky.cds.unistra.fr/:path*' }];
+},
 };
 
 export default nextConfig;

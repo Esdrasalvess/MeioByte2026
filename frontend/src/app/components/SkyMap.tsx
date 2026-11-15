@@ -3,6 +3,12 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+declare global {
+  interface Window {
+    A?: any;
+  }
+}
+
 const CHALLENGE_TARGETS = [
   { name: "Barnard's Star", ra: '269.452075', dec: '4.693391' },
   { name: 'WISE 0855', ra: '133.795129', dec: '-7.245147' },
@@ -11,10 +17,17 @@ const CHALLENGE_TARGETS = [
   { name: 'R Draconis', ra: '248.163292', dec: '66.754722' },
 ];
 
-const FOV_OPTIONS = [0.08, 0.16, 0.24, 0.4]; // graus (tamanho do recorte)
-const SEARCH_RADIUS = 0.05; // graus (raio da busca na IRSA)
+// "Campo" = tamanho do recorte dos frames (graus). O mapa mostra 3x esse valor.
+const FOV_OPTIONS = [0.08, 0.16, 0.24, 0.4];
+const MAP_FOV_FACTOR = 3;
+const SEARCH_RADIUS = 0.05;
 const MAX_PARALLEL = 4;
 
+const ALADIN_SRC = '/aladin.js';
+const SURVEYS = [
+  { id: 'dss', label: 'DSS2 cor (óptico)', url: 'https://irsa.ipac.caltech.edu/data/hips/CDS/DSS2/color' },
+];
+const surveyUrl = (id: string) => (SURVEYS.find((s) => s.id === id) ?? SURVEYS[0]).url;
 type TileStatus = 'loading' | 'ok' | 'nocoverage' | 'error';
 type TileState = { status: TileStatus; src?: string; message?: string };
 type Center = { ra: string; dec: string; fov: number };
@@ -22,6 +35,8 @@ type View = { s: number; x: number; y: number };
 type LogLevel = 'info' | 'ok' | 'warn' | 'error';
 type LogEntry = { t: string; level: LogLevel; text: string };
 type Phase = 'idle' | 'searching' | 'rendering' | 'done' | 'error';
+type MapState = 'loading' | 'ready' | 'error';
+type Mode = 'map' | 'frame';
 
 const frameKey = (f: any): string => f?.access_url || f?.accessUrl || f?.url || f?.fileUrl || '';
 const shortName = (key: string) => (key.split('?')[0].split('/').pop() || key).slice(-34);
@@ -41,10 +56,70 @@ const LOG_COLORS: Record<LogLevel, string> = {
   error: 'text-red-400',
 };
 
+// ---- Carrega o Aladin Lite (script do CDS) só no navegador ----
+let aladinPromise: Promise<any> | null = null;
+
+function loadAladin(): Promise<any> {
+  if (aladinPromise) return aladinPromise;
+
+  const loadAsScript = () =>
+    new Promise<any>((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = ALADIN_SRC;
+      s.async = true;
+      s.onload = () => (window.A ? resolve(window.A) : reject(new Error('O script carregou, mas window.A não existe')));
+      s.onerror = () => reject(new Error(`Não foi possível baixar ${ALADIN_SRC}`));
+      document.head.appendChild(s);
+    });
+
+  const load = (async () => {
+    let A: any = window.A;
+
+    if (!A) {
+      // 1) O arquivo do npm é módulo ES: import() nativo do navegador, fora do bundler
+      try {
+        const dynImport = new Function('u', 'return import(u)') as (u: string) => Promise<any>;
+        const mod = await dynImport(new URL(ALADIN_SRC, window.location.origin).href);
+        A = mod?.default || mod?.A || window.A;
+      } catch (e: any) {
+        // 2) Plano B: carregar como <script> clássico (formato antigo)
+        try {
+          A = await loadAsScript();
+        } catch (e2: any) {
+          throw new Error(`import(): ${e?.message || e} | script: ${e2?.message || e2}`);
+        }
+      }
+    }
+
+    if (!A) throw new Error('O arquivo carregou, mas não exporta o Aladin (default ou A)');
+    if (A.init && typeof A.init.then === 'function') await A.init;
+    return A;
+  })();
+
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('Timeout de 20s carregando o Aladin Lite')), 20000)
+  );
+
+  aladinPromise = Promise.race([load, timeout]).catch((e) => {
+    aladinPromise = null; // permite tentar de novo
+    throw e;
+  });
+  return aladinPromise;
+}
+
+function setSurvey(aladin: any, A: any, url: string, onError: (m: string) => void) {
+  const hips = A.imageHiPS(url, { errorCallback: () => onError(`HiPS não encontrado: ${url}`) });
+  aladin.setBaseImageLayer(hips);
+}
 export default function SkyMap() {
   const [ra, setRa] = useState('269.452075');
   const [dec, setDec] = useState('4.693391');
   const [fov, setFov] = useState(0.24);
+  const [band, setBand] = useState('color');
+  const [mode, setMode] = useState<Mode>('map');
+  const [mapState, setMapState] = useState<MapState>('loading');
+  const [mapMsg, setMapMsg] = useState('Carregando o Aladin Lite...');
+
   const [center, setCenter] = useState<Center>({ ra: '269.452075', dec: '4.693391', fov: 0.24 });
   const [frames, setFrames] = useState<any[]>([]);
   const [tiles, setTiles] = useState<Record<string, TileState>>({});
@@ -57,6 +132,7 @@ export default function SkyMap() {
 
   const runRef = useRef(0);
   const centerRef = useRef<Center>(center);
+  const bandRef = useRef(band);
   const queueRef = useRef<(() => Promise<void>)[]>([]);
   const activeRef = useRef(0);
   const blobUrlsRef = useRef<string[]>([]);
@@ -65,6 +141,9 @@ export default function SkyMap() {
   const viewerRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ px: number; py: number; vx: number; vy: number } | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
+  const aladinRef = useRef<any>(null);
+  const aRef = useRef<any>(null);
+  const overlayRef = useRef<any>(null);
 
   const addLog = useCallback((level: LogLevel, text: string) => {
     const t = new Date().toLocaleTimeString('pt-BR');
@@ -75,11 +154,100 @@ export default function SkyMap() {
     logEndRef.current?.scrollIntoView({ block: 'end' });
   }, [log, showLog]);
 
+  // ---------------- Aladin ----------------
+  const moveMap = useCallback(
+    (c: Center) => {
+      const al = aladinRef.current;
+      const A = aRef.current;
+      if (!al || !A) return;
+      try {
+        const r = parseFloat(c.ra);
+        const d = parseFloat(c.dec);
+        al.gotoRaDec(r, d);
+        const setF = al.setFoV || al.setFov;
+        if (setF) setF.call(al, c.fov * MAP_FOV_FACTOR);
+
+        // círculo amarelo = área que será recortada nos frames
+        if (!overlayRef.current) {
+          overlayRef.current = A.graphicOverlay({ color: '#facc15', lineWidth: 2 });
+          al.addOverlay(overlayRef.current);
+        } else {
+          overlayRef.current.removeAll();
+        }
+        overlayRef.current.add(A.circle(r, d, c.fov / 2));
+      } catch (e: any) {
+        addLog('warn', `Aladin (mover mapa): ${e?.message || e}`);
+      }
+    },
+    [addLog]
+  );
+
+  const initAladin = useCallback(
+    (isCancelled: () => boolean = () => false) => {
+      setMapState('loading');
+      setMapMsg('Carregando o Aladin Lite...');
+      addLog('info', 'Carregando Aladin Lite do CDS...');
+
+      loadAladin()
+        .then((A) => {
+          if (isCancelled() || aladinRef.current) return;
+          const c = centerRef.current;
+const bandUrl = surveyUrl(bandRef.current);
+          aRef.current = A;
+          aladinRef.current = A.aladin('#aladin-lite-div', {
+            survey: bandUrl,
+            target: `${c.ra} ${c.dec}`,
+            fov: c.fov * MAP_FOV_FACTOR,
+            projection: 'SIN',
+            cooFrame: 'equatorial',
+            showCooGrid: false,
+            showFullscreenControl: false,
+            showSimbadPointerControl: false,
+          });
+
+          moveMap(c);
+          setMapState('ready');
+          setMapMsg('Mapa pronto');
+          addLog('ok', `Aladin pronto · HiPS ${bandRef.current}`);
+        })
+        .catch((e: any) => {
+          if (isCancelled()) return;
+          setMapState('error');
+          setMapMsg(e?.message || 'Erro desconhecido');
+          addLog('error', `Aladin: ${e?.message || e}`);
+        });
+    },
+    [addLog, moveMap]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    initAladin(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Troca de banda (HiPS)
+useEffect(() => {
+  bandRef.current = band;
+  const al = aladinRef.current;
+  const A = aRef.current;
+  if (!al || !A) return;
+  try {
+    setSurvey(al, A, surveyUrl(band), (m) => addLog('error', m));
+    addLog('info', `Fundo trocado para ${band}`);
+  } catch (e: any) {
+    addLog('error', `Falha ao trocar HiPS: ${e?.message || e}`);
+  }
+}, [band, addLog]);
+
+  // ---------------- Frames (fila de recortes) ----------------
   const setTile = useCallback((key: string, state: TileState) => {
     setTiles((prev) => ({ ...prev, [key]: state }));
   }, []);
 
-  // Fila: no máximo MAX_PARALLEL jobs ao mesmo tempo
   const pump = useCallback(() => {
     while (activeRef.current < MAX_PARALLEL && queueRef.current.length > 0) {
       const job = queueRef.current.shift()!;
@@ -163,10 +331,13 @@ export default function SkyMap() {
     const c: Center = { ra: String(cleanRa), dec: String(cleanDec), fov: targetFov };
     centerRef.current = c;
     setCenter(c);
+    moveMap(c); // o mapa vai para o alvo na hora, sem esperar a IRSA
+
     setFrames([]);
     setTiles({});
     setSelectedKey(null);
     setView({ s: 1, x: 0, y: 0 });
+    setMode('map');
     setPhase('searching');
     setStatusMsg('Consultando a IRSA (pode levar até 30 s se ela estiver lenta)...');
     addLog('info', `Busca: RA ${c.ra}, Dec ${c.dec}, campo ${c.fov}°`);
@@ -179,14 +350,13 @@ export default function SkyMap() {
       const data = await res.json().catch(() => ({}));
       if (runId !== runRef.current) return;
 
-      // Debug vindo do servidor
       const dbg = data?.debug;
       if (dbg) {
         addLog('info', `Servidor: ${dbg.source}${dbg.stale ? ' (DADOS ANTIGOS)' : ''} em ${dbg.elapsedMs}ms`);
         (dbg.attempts || []).forEach((a: any) =>
           addLog(
             a.status === 200 ? 'ok' : 'warn',
-            `  tentativa ${a.n}: ${a.status} em ${a.ms}ms${a.note ? ' · ' + a.note : ''}`
+            `  ${a.via || ''} tentativa ${a.n}: ${a.status} em ${a.ms}ms${a.note ? ' · ' + a.note : ''}`
           )
         );
       }
@@ -228,7 +398,7 @@ export default function SkyMap() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Seleciona automaticamente o primeiro frame com cobertura (até o usuário escolher um)
+  // Seleciona o primeiro frame com cobertura (até o usuário escolher um)
   useEffect(() => {
     if (userPickedRef.current) return;
     const first = frames.find((f) => tiles[frameKey(f)]?.status === 'ok');
@@ -249,6 +419,7 @@ export default function SkyMap() {
   const pickFrame = (key: string) => {
     userPickedRef.current = true;
     setSelectedKey(key);
+    setMode('frame');
   };
 
   const retryTile = (frame: any) => {
@@ -261,7 +432,7 @@ export default function SkyMap() {
     });
   };
 
-  // ---- Zoom e arraste ----
+  // ---- Zoom e arraste do visualizador de frame ----
   const zoomAt = (factor: number, cx: number, cy: number) => {
     setView((v) => {
       const s = Math.min(16, Math.max(1, v.s * factor));
@@ -269,19 +440,16 @@ export default function SkyMap() {
       return { s, x: cx - (cx - v.x) * k, y: cy - (cy - v.y) * k };
     });
   };
-
   const onWheel = (e: React.WheelEvent) => {
     const rect = viewerRef.current?.getBoundingClientRect();
     if (!rect) return;
     zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX - rect.left, e.clientY - rect.top);
   };
-
   const zoomButton = (factor: number) => {
     const rect = viewerRef.current?.getBoundingClientRect();
     if (!rect) return;
     zoomAt(factor, rect.width / 2, rect.height / 2);
   };
-
   const onPointerDown = (e: React.PointerEvent) => {
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     dragRef.current = { px: e.clientX, py: e.clientY, vx: view.x, vy: view.y };
@@ -309,17 +477,24 @@ export default function SkyMap() {
   else if (phase === 'rendering' && !allDone)
     banner = { color: 'bg-blue-900/40 border-blue-700 text-blue-200', text: `⏳ Baixando recortes: ${done}/${frames.length}` };
   else if (allDone && counts.ok === 0)
-    banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ Nenhum recorte funcionou. Veja o log abaixo.' };
+    banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ Nenhum recorte funcionou. Veja o log.' };
   else if (allDone && counts.error > 0)
-    banner = { color: 'bg-yellow-900/40 border-yellow-700 text-yellow-200', text: `⚠️ ${counts.ok} ok, mas ${counts.error} falharam. Dá para tentar de novo.` };
+    banner = { color: 'bg-yellow-900/40 border-yellow-700 text-yellow-200', text: `⚠️ ${counts.ok} ok, mas ${counts.error} falharam.` };
   else if (allDone)
-    banner = { color: 'bg-green-900/40 border-green-700 text-green-200', text: `✅ ${counts.ok} imagens carregadas (${counts.nocoverage} sem cobertura).` };
+    banner = { color: 'bg-green-900/40 border-green-700 text-green-200', text: `✅ ${counts.ok} frames carregados (${counts.nocoverage} sem cobertura).` };
   else banner = { color: 'bg-gray-800 border-gray-700 text-gray-300', text: statusMsg || 'Pronto.' };
 
   const loading = phase === 'searching';
   const selectedFrame = frames.find((f) => frameKey(f) === selectedKey) || null;
   const selectedTile = selectedKey ? tiles[selectedKey] : undefined;
   const stripFrames = frames.filter((f) => tiles[frameKey(f)]?.status !== 'nocoverage');
+
+  const mapChip =
+    mapState === 'ready'
+      ? 'bg-green-900/40 border-green-700 text-green-300'
+      : mapState === 'error'
+      ? 'bg-red-900/40 border-red-700 text-red-300'
+      : 'bg-blue-900/40 border-blue-700 text-blue-300';
 
   return (
     <div className="flex flex-col h-screen bg-gray-950 text-white overflow-hidden">
@@ -343,29 +518,15 @@ export default function SkyMap() {
         <form onSubmit={handleSearch} className="flex gap-2 items-center text-sm">
           <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
             <span className="text-[10px] text-gray-400">RA:</span>
-            <input
-              type="text"
-              value={ra}
-              onChange={(e) => setRa(e.target.value)}
-              className="w-20 bg-transparent text-white text-xs outline-none"
-            />
+            <input type="text" value={ra} onChange={(e) => setRa(e.target.value)} className="w-20 bg-transparent text-white text-xs outline-none" />
           </div>
           <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
             <span className="text-[10px] text-gray-400">Dec:</span>
-            <input
-              type="text"
-              value={dec}
-              onChange={(e) => setDec(e.target.value)}
-              className="w-20 bg-transparent text-white text-xs outline-none"
-            />
+            <input type="text" value={dec} onChange={(e) => setDec(e.target.value)} className="w-20 bg-transparent text-white text-xs outline-none" />
           </div>
           <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
             <span className="text-[10px] text-gray-400">Campo:</span>
-            <select
-              value={fov}
-              onChange={(e) => setFov(parseFloat(e.target.value))}
-              className="bg-transparent text-white text-xs outline-none"
-            >
+            <select value={fov} onChange={(e) => setFov(parseFloat(e.target.value))} className="bg-transparent text-white text-xs outline-none">
               {FOV_OPTIONS.map((o) => (
                 <option key={o} value={o} className="bg-gray-900">
                   {o}°
@@ -373,11 +534,7 @@ export default function SkyMap() {
               ))}
             </select>
           </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-60 px-4 py-1 rounded text-xs font-medium transition"
-          >
+          <button type="submit" disabled={loading} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-60 px-4 py-1 rounded text-xs font-medium transition">
             {loading ? 'Buscando...' : 'Gerar Mapa'}
           </button>
         </form>
@@ -386,104 +543,153 @@ export default function SkyMap() {
       <div className="flex flex-1 overflow-hidden relative">
         {/* Coluna principal */}
         <main className="flex-1 flex flex-col min-w-0 p-4 gap-3">
+          {/* Faixa de status dos frames */}
           <div className={`border rounded px-3 py-2 text-xs flex flex-wrap items-center justify-between gap-2 ${banner.color}`}>
             <span>{banner.text}</span>
             <div className="flex items-center gap-2 text-[11px] font-mono">
               <span>RA {center.ra}, Dec {center.dec} · {center.fov}°</span>
               {counts.error > 0 && (
-                <button
-                  onClick={retryAllErrors}
-                  className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white font-sans transition"
-                >
+                <button onClick={retryAllErrors} className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white font-sans transition">
                   Tentar erros de novo
                 </button>
               )}
               {phase === 'error' && (
-                <button
-                  onClick={() => fetchData(ra, dec, fov)}
-                  className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white font-sans transition"
-                >
+                <button onClick={() => fetchData(ra, dec, fov)} className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white font-sans transition">
                   Tentar de novo
                 </button>
               )}
             </div>
           </div>
 
+          {/* Barra do mapa */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <div className="flex rounded overflow-hidden border border-gray-700">
+              <button
+                onClick={() => setMode('map')}
+                className={`px-3 py-1 transition ${mode === 'map' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
+              >
+                🗺️ Mapa do céu
+              </button>
+              <button
+                onClick={() => setMode('frame')}
+                disabled={!selectedFrame}
+                className={`px-3 py-1 transition disabled:opacity-40 ${mode === 'frame' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
+              >
+                🎞️ Frame individual
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
+              <span className="text-[10px] text-gray-400">Fundo do mapa:</span>
+              <select value={band} onChange={(e) => setBand(e.target.value)} className="bg-transparent text-white text-xs outline-none">
+                {SURVEYS.map((b) => (
+                  <option key={b.id} value={b.id} className="bg-gray-900">
+                    {b.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <span className={`border rounded-full px-2.5 py-0.5 text-[11px] ${mapChip}`}>
+              {mapState === 'ready' ? '🟢' : mapState === 'error' ? '🔴' : '🟡'} Aladin: {mapMsg}
+            </span>
+            {mapState === 'error' && (
+              <button onClick={() => initAladin()} className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white transition">
+                Tentar Aladin de novo
+              </button>
+            )}
+          </div>
+
           {frames.length > 0 && !allDone && (
             <div className="h-1.5 w-full bg-gray-800 rounded overflow-hidden">
-              <div
-                className="h-full bg-blue-500 transition-all duration-300"
-                style={{ width: `${(done / frames.length) * 100}%` }}
-              />
+              <div className="h-full bg-blue-500 transition-all duration-300" style={{ width: `${(done / frames.length) * 100}%` }} />
             </div>
           )}
 
-          {/* Mapa principal */}
+          {/* Área do visualizador: mapa Aladin e frame ficam montados, só alterna a visibilidade */}
           <div className="flex-1 min-h-0 relative bg-black rounded-lg border border-gray-800 overflow-hidden">
-            <div
-              ref={viewerRef}
-              className="absolute inset-0 cursor-grab active:cursor-grabbing touch-none select-none"
-              onWheel={onWheel}
-              onPointerDown={onPointerDown}
-              onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp}
-              onPointerCancel={onPointerUp}
-            >
-              {selectedTile?.status === 'ok' && selectedTile.src ? (
-                <div
-                  className="absolute inset-0"
-                  style={{
-                    transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`,
-                    transformOrigin: '0 0',
-                  }}
-                >
-                  <img
-                    src={selectedTile.src}
-                    alt="Mapa do céu"
-                    draggable={false}
-                    className="w-full h-full object-contain"
-                    style={{ imageRendering: 'pixelated' }}
-                  />
-                  {/* Mira no centro (posição do alvo) */}
-                  <div
-                    className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-yellow-400/80 pointer-events-none"
-                    style={{ width: `${28 / view.s}px`, height: `${28 / view.s}px`, borderWidth: `${1 / view.s}px` }}
-                  />
-                </div>
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm px-6 text-center">
-                  {selectedTile?.status === 'error' ? (
-                    <div className="flex flex-col items-center gap-2">
-                      <span className="text-xs text-red-400">{selectedTile.message}</span>
-                      {selectedFrame && (
-                        <button
-                          onClick={() => retryTile(selectedFrame)}
-                          className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-600 px-3 py-1 rounded"
-                        >
-                          ↻ Tentar de novo
-                        </button>
-                      )}
-                    </div>
-                  ) : phase === 'searching' || (phase === 'rendering' && !allDone) ? (
-                    <div className="flex flex-col items-center gap-2">
+            {/* Mapa Aladin */}
+            <div className={`absolute inset-0 ${mode === 'map' ? '' : 'invisible pointer-events-none'}`}>
+              <div className="absolute inset-0">
+  <div id="aladin-lite-div" style={{ width: '100%', height: '100%' }} />
+</div>
+              {mapState !== 'ready' && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-center px-6 z-10">
+                  {mapState === 'loading' ? (
+                    <div className="flex flex-col items-center gap-2 text-gray-400">
                       <div className="h-8 w-8 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
-                      <span className="text-xs">{phase === 'searching' ? 'Consultando a IRSA...' : 'Montando o mapa...'}</span>
+                      <span className="text-xs">{mapMsg}</span>
                     </div>
                   ) : (
-                    <span className="text-xs">Sem imagem para mostrar. Veja o log ao lado.</span>
+                    <div className="flex flex-col items-center gap-2 max-w-md">
+                      <span className="text-sm text-red-400">Não consegui carregar o mapa</span>
+                      <span className="text-xs text-gray-400">{mapMsg}</span>
+                      <span className="text-[11px] text-gray-500">
+                        Os frames individuais continuam funcionando na aba “Frame individual”.
+                      </span>
+                    </div>
                   )}
                 </div>
               )}
+              {mapState === 'ready' && (
+                <div className="absolute bottom-2 left-3 text-[10px] text-gray-300 font-mono pointer-events-none z-10 drop-shadow">
+Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames                </div>
+              )}
             </div>
 
-            <div className="absolute top-3 right-3 flex flex-col gap-1">
-              <button onClick={() => zoomButton(1.5)} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-lg leading-none">+</button>
-              <button onClick={() => zoomButton(1 / 1.5)} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-lg leading-none">−</button>
-              <button onClick={() => setView({ s: 1, x: 0, y: 0 })} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-[10px]">1:1</button>
-            </div>
+            {/* Frame individual */}
+            <div className={`absolute inset-0 ${mode === 'frame' ? '' : 'invisible pointer-events-none'}`}>
+              <div
+                ref={viewerRef}
+                className="absolute inset-0 cursor-grab active:cursor-grabbing touch-none select-none"
+                onWheel={onWheel}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={onPointerUp}
+              >
+                {selectedTile?.status === 'ok' && selectedTile.src ? (
+                  <div
+                    className="absolute inset-0"
+                    style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`, transformOrigin: '0 0' }}
+                  >
+                    <img src={selectedTile.src} alt="Frame SPHEREx" draggable={false} className="w-full h-full object-contain" style={{ imageRendering: 'pixelated' }} />
+                    <div
+                      className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-yellow-400/80 pointer-events-none"
+                      style={{ width: `${28 / view.s}px`, height: `${28 / view.s}px`, borderWidth: `${1 / view.s}px` }}
+                    />
+                  </div>
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm px-6 text-center">
+                    {selectedTile?.status === 'error' ? (
+                      <div className="flex flex-col items-center gap-2">
+                        <span className="text-xs text-red-400">{selectedTile.message}</span>
+                        {selectedFrame && (
+                          <button onClick={() => retryTile(selectedFrame)} className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-600 px-3 py-1 rounded">
+                            ↻ Tentar de novo
+                          </button>
+                        )}
+                      </div>
+                    ) : phase === 'searching' || (phase === 'rendering' && !allDone) ? (
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="h-8 w-8 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
+                        <span className="text-xs">Montando o frame...</span>
+                      </div>
+                    ) : (
+                      <span className="text-xs">Sem frame para mostrar. Veja o log ao lado.</span>
+                    )}
+                  </div>
+                )}
+              </div>
 
-            <div className="absolute bottom-2 left-3 text-[10px] text-gray-500 font-mono pointer-events-none">
-              zoom {view.s.toFixed(1)}x · roda do mouse = zoom · arraste = mover · círculo = alvo
+              <div className="absolute top-3 right-3 flex flex-col gap-1">
+                <button onClick={() => zoomButton(1.5)} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-lg leading-none">+</button>
+                <button onClick={() => zoomButton(1 / 1.5)} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-lg leading-none">−</button>
+                <button onClick={() => setView({ s: 1, x: 0, y: 0 })} className="w-8 h-8 bg-gray-900/90 hover:bg-gray-800 border border-gray-700 rounded text-[10px]">1:1</button>
+              </div>
+              <div className="absolute bottom-2 left-3 text-[10px] text-gray-500 font-mono pointer-events-none">
+                zoom {view.s.toFixed(1)}x · roda do mouse = zoom · arraste = mover · círculo = alvo
+              </div>
             </div>
           </div>
 
@@ -493,7 +699,7 @@ export default function SkyMap() {
               {stripFrames.map((frame) => {
                 const key = frameKey(frame);
                 const tile = tiles[key] || { status: 'loading' as TileStatus };
-                const isSelected = selectedKey === key;
+                const isSelected = selectedKey === key && mode === 'frame';
                 const idx = frames.indexOf(frame);
 
                 return (
@@ -506,17 +712,9 @@ export default function SkyMap() {
                   >
                     <div className="flex-1 min-h-0 bg-black rounded overflow-hidden flex items-center justify-center">
                       {tile.status === 'ok' && tile.src && (
-                        <img
-                          src={tile.src}
-                          alt={`Frame ${idx + 1}`}
-                          draggable={false}
-                          className="w-full h-full object-cover"
-                          style={{ imageRendering: 'pixelated' }}
-                        />
+                        <img src={tile.src} alt={`Frame ${idx + 1}`} draggable={false} className="w-full h-full object-cover" style={{ imageRendering: 'pixelated' }} />
                       )}
-                      {tile.status === 'loading' && (
-                        <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
-                      )}
+                      {tile.status === 'loading' && <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />}
                       {tile.status === 'error' && (
                         <button
                           onClick={(e) => {
@@ -530,7 +728,7 @@ export default function SkyMap() {
                       )}
                     </div>
                     <div className="text-[9px] text-gray-400 font-mono truncate">
-                      #{idx + 1} · {frame.energy_bandpassname || 'IR'}
+                      #{idx + 1} · {frame.date || frame.energy_bandpassname || 'IR'}
                     </div>
                   </div>
                 );
@@ -543,7 +741,7 @@ export default function SkyMap() {
         <aside className="w-80 bg-gray-900/95 border-l border-gray-800 flex flex-col z-10 p-4 gap-3 backdrop-blur min-h-0">
           <div>
             <h3 className="font-semibold text-sm text-gray-200">Frame selecionado</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Escolha outro na faixa embaixo do mapa.</p>
+            <p className="text-xs text-gray-400 mt-0.5">Clique num frame da faixa para ver o recorte dele.</p>
           </div>
 
           {selectedFrame ? (
@@ -551,15 +749,11 @@ export default function SkyMap() {
               <div className="flex flex-col gap-1 text-xs">
                 <div className="flex justify-between py-1 border-b border-gray-700">
                   <span className="text-gray-400">Frame:</span>
-                  <span className="font-mono text-gray-200">
-                    #{frames.indexOf(selectedFrame) + 1} de {frames.length}
-                  </span>
+                  <span className="font-mono text-gray-200">#{frames.indexOf(selectedFrame) + 1} de {frames.length}</span>
                 </div>
                 <div className="flex justify-between py-1 border-b border-gray-700">
                   <span className="text-gray-400">Data:</span>
-                  <span className="font-mono text-gray-200">
-                    {selectedFrame.date || selectedFrame.obs_release_date || 'N/A'}
-                  </span>
+                  <span className="font-mono text-gray-200">{selectedFrame.date || selectedFrame.obs_release_date || 'N/A'}</span>
                 </div>
                 <div className="flex justify-between py-1 border-b border-gray-700">
                   <span className="text-gray-400">Banda:</span>
@@ -584,12 +778,8 @@ export default function SkyMap() {
             <div className="flex items-center justify-between mb-2">
               <h3 className="font-semibold text-xs text-gray-300">Log de debug</h3>
               <div className="flex gap-2 text-[10px]">
-                <button onClick={() => setShowLog((s) => !s)} className="text-gray-400 hover:text-white">
-                  {showLog ? 'ocultar' : 'mostrar'}
-                </button>
-                <button onClick={() => setLog([])} className="text-gray-400 hover:text-white">
-                  limpar
-                </button>
+                <button onClick={() => setShowLog((s) => !s)} className="text-gray-400 hover:text-white">{showLog ? 'ocultar' : 'mostrar'}</button>
+                <button onClick={() => setLog([])} className="text-gray-400 hover:text-white">limpar</button>
               </div>
             </div>
             {showLog && (
@@ -606,8 +796,7 @@ export default function SkyMap() {
           </div>
 
           <div className="text-[10px] text-center text-gray-500 border-t border-gray-800 pt-3">
-            SPHEREx Explorer • Dados: NASA/IPAC IRSA
-          </div>
+SPHEREx: IRSA/IPAC · Fundo do mapa: CDS Strasbourg          </div>
         </aside>
       </div>
     </div>

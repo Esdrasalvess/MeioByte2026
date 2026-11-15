@@ -1,5 +1,7 @@
 // app/api/spherex/route.ts
 import { NextResponse } from 'next/server';
+import fs from 'node:fs';
+import path from 'node:path';
 
 type Row = Record<string, string>;
 type Attempt = { n: number; ms: number; status: number | string; note?: string; via?: string };
@@ -7,6 +9,53 @@ type Attempt = { n: number; ms: number; status: number | string; note?: string; 
 const cache = new Map<string, { at: number; data: Row[] }>();
 const inflight = new Map<string, Promise<{ rows: Row[]; attempts: Attempt[]; via: string }>>();
 const CACHE_TTL = 10 * 60 * 1000;
+
+// Versões atuais (QR2 está superado e não é mais pesquisável)
+const COLLECTIONS = ['spherex_dr1', 'spherex_qr3'];
+const isCurrentRelease = (url: string) => /\/(dr1|qr3)\//.test(url);
+const isLevel2Fits = (url: string) => /\.fits$/i.test(url) && url.includes('/level2/');
+
+// ---- Cache em disco (sobrevive a reinícios do servidor) ----
+const CACHE_DIR = path.join(process.cwd(), '.cache');
+const diskPath = (key: string) => path.join(CACHE_DIR, `spherex-${key.replace(/[^\w.-]/g, '_')}.json`);
+function diskRead(key: string): Row[] | null {
+  try {
+    return JSON.parse(fs.readFileSync(diskPath(key), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+function diskWrite(key: string, data: Row[]) {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(diskPath(key), JSON.stringify(data));
+  } catch {}
+}
+
+// ---- Semente de emergência (dev): frames do Barnard's Star vistos no log, usados só se TAP e SIA caírem ----
+const SEED = { ra: 269.452075, dec: 4.693391 };
+const B = 'https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/';
+const SEED_URLS = [
+  `${B}2025W35_1A/l2b-v27-2026-230/6/level2_2025W35_1A_0484_2D6_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/6/level2_2025W35_1A_0484_1D6_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/2/level2_2025W35_1A_0511_1D2_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/3/level2_2025W35_1A_0484_1D3_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/1/level2_2025W35_1A_0658_1D1_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/3/level2_2025W35_1A_0484_2D3_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/5/level2_2025W35_1A_0511_1D5_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/4/level2_2025W35_1A_0658_1D4_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/1/level2_2025W35_1A_0658_2D1_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W35_1A/l2b-v27-2026-230/4/level2_2025W35_1A_0658_2D4_spx_l2b-v27-2026-230.fits`,
+  `${B}2025W33_2C/l2b-v27-2026-228/6/level2_2025W33_2C_0321_2D6_spx_l2b-v27-2026-228.fits`,
+];
+function seedRows(ra: number, dec: number): Row[] {
+  if (Math.abs(ra - SEED.ra) > 0.01 || Math.abs(dec - SEED.dec) > 0.01) return [];
+  return SEED_URLS.map((u) => ({
+    access_url: u,
+    date: '',
+    energy_bandpassname: `D${u.match(/\/(\d)\/level2_/)?.[1] ?? '?'}`,
+  }));
+}
 
 function parseCsvLine(line: string): string[] {
   const out: string[] = [];
@@ -68,10 +117,19 @@ async function getWithRetry(url: string, via: string, attempts: Attempt[], tries
 }
 
 // MJD -> AAAA-MM-DD
-function mjdToDate(v: string): string {
-  const n = parseFloat(v);
+function mjdToDate(v: string | undefined): string {
+  const n = parseFloat(v || '');
   if (!Number.isFinite(n) || n < 10000 || n > 100000) return '';
   return new Date((n - 40587) * 86400000).toISOString().slice(0, 10);
+}
+
+function dedupe(rows: Row[]): Row[] {
+  const seen = new Set<string>();
+  return rows.filter((r) => {
+    if (seen.has(r.access_url)) return false;
+    seen.add(r.access_url);
+    return true;
+  });
 }
 
 // ---- Caminho principal: TAP ----
@@ -91,21 +149,62 @@ ORDER BY p.time_bounds_lower`;
   const text = await getWithRetry(url, 'TAP', attempts, 3, 60000);
 
   const raw = csvToRows(text);
-  const rows = raw
-    .filter((r) => r.access_url && /\.fits$/i.test(r.access_url) && r.access_url.includes('/level2/'))
-    .map((r) => ({
-      ...r,
-      date: mjdToDate(r.time_bounds_lower),
-    }));
-  attempts.push({ n: attempts.length + 1, ms: 0, status: 'info', via: 'TAP', note: `${raw.length} linhas brutas, ${rows.length} imagens level2` });
+  const rows = dedupe(
+    raw
+      .filter((r) => r.access_url && isLevel2Fits(r.access_url) && isCurrentRelease(r.access_url))
+      .map((r) => ({ ...r, date: mjdToDate(r.time_bounds_lower) }))
+  );
+  attempts.push({
+    n: attempts.length + 1,
+    ms: 0,
+    status: 'info',
+    via: 'TAP',
+    note: `${raw.length} linhas brutas, ${rows.length} imagens level2 (DR1/QR3)`,
+  });
   return rows;
 }
 
-// ---- Reserva: SIA ----
+// ---- Reserva: SIA2 (DR1 + QR3) ----
 async function querySia(ra: number, dec: number, size: string, attempts: Attempt[]): Promise<Row[]> {
-  const url = `https://irsa.ipac.caltech.edu/SIA?COLLECTION=spherex_qr3&POS=circle+${ra}+${dec}+${size}&RESPONSEFORMAT=CSV`;
-  const text = await getWithRetry(url, 'SIA', attempts, 2, 25000);
-  return csvToRows(text);
+  const results = await Promise.allSettled(
+    COLLECTIONS.map((c) =>
+      getWithRetry(
+        `https://irsa.ipac.caltech.edu/SIA?COLLECTION=${c}&POS=circle+${ra}+${dec}+${size}&RESPONSEFORMAT=CSV`,
+        `SIA ${c}`,
+        attempts,
+        2,
+        25000
+      )
+    )
+  );
+
+  const raw: Row[] = [];
+  let okCount = 0;
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      okCount++;
+      raw.push(...csvToRows(r.value));
+    }
+  }
+  if (!okCount) throw new Error('SIA: nenhuma coleção respondeu');
+
+  // Colunas ObsCore (nomes padrão, não confirmados na documentação): t_min em MJD, em_min/em_max em metros.
+  // Se vierem diferentes, o console.log abaixo mostra a primeira linha.
+  if (raw[0]) console.log('[spherex SIA] colunas:', Object.keys(raw[0]).join(', '));
+
+  return dedupe(
+    raw
+      .filter((r) => r.access_url && isLevel2Fits(r.access_url))
+      .map((r) => ({
+        ...r,
+        date: r.date || mjdToDate(r.t_min),
+        energy_bandpassname:
+          r.energy_bandpassname ||
+          (r.em_min && r.em_max
+            ? `${(parseFloat(r.em_min) * 1e6).toFixed(2)}–${(parseFloat(r.em_max) * 1e6).toFixed(2)} µm`
+            : ''),
+      }))
+  );
 }
 
 async function fetchRows(ra: number, dec: number, size: string) {
@@ -156,7 +255,10 @@ export async function GET(request: Request) {
 
   try {
     const { rows, attempts, via } = await job;
-    if (rows.length > 0) cache.set(key, { at: Date.now(), data: rows });
+    if (rows.length > 0) {
+      cache.set(key, { at: Date.now(), data: rows });
+      diskWrite(key, rows);
+    }
     console.log(`${tag} ${via} ok: ${rows.length} linhas, ${Date.now() - t0}ms${shared ? ' (compartilhado)' : ''}`);
     return NextResponse.json({
       data: rows,
@@ -167,12 +269,32 @@ export async function GET(request: Request) {
     console.error(`${tag} FALHOU: ${error.message}`);
     attempts.forEach((a) => console.error(`   ${a.via} tentativa ${a.n}: ${a.status} em ${a.ms}ms ${a.note || ''}`));
 
+    // 1) cache em memória vencido
     if (hit) {
       return NextResponse.json({
         data: hit.data,
         debug: { source: 'cache antigo', stale: true, error: error.message, attempts, elapsedMs: Date.now() - t0 },
       });
     }
+
+    // 2) cache em disco
+    const disk = diskRead(key);
+    if (disk && disk.length) {
+      return NextResponse.json({
+        data: disk,
+        debug: { source: 'cache em disco', stale: true, error: error.message, attempts, elapsedMs: Date.now() - t0 },
+      });
+    }
+
+    // 3) semente de emergência (só Barnard's Star)
+    const seed = seedRows(ra, dec);
+    if (seed.length) {
+      return NextResponse.json({
+        data: seed,
+        debug: { source: 'semente (busca da IRSA fora do ar)', stale: true, error: error.message, attempts, elapsedMs: Date.now() - t0 },
+      });
+    }
+
     return NextResponse.json(
       { error: 'A IRSA não respondeu (TAP e SIA).', debug: { error: error.message, attempts, elapsedMs: Date.now() - t0 } },
       { status: 502 }
