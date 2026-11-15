@@ -1,6 +1,7 @@
 // app/api/align/route.ts
 import { NextResponse } from 'next/server';
 import { D2R, R2D, skyToTangent, tangentToSky, gridToTangentDeg } from '../../../lib/sky';
+import { acquire, release, fetchBuffer } from '../../../lib/irsa';
 
 type Hdu = { header: Record<string, string>; dataStart: number };
 type Sip = [number, number, number][];
@@ -13,42 +14,9 @@ type Wcs = {
   ctype: string;
 };
 
-// ---- Limita pedidos simultâneos à IRSA ----
-const MAX_CONCURRENT = 3;
-let active = 0;
-const waiting: (() => void)[] = [];
-async function acquire() {
-  if (active < MAX_CONCURRENT) { active++; return; }
-  await new Promise<void>((resolve) => waiting.push(resolve));
-  active++;
-}
-function release() {
-  active--;
-  const next = waiting.shift();
-  if (next) next();
-}
-
-// ---- Cache dos frames já alinhados ----
+// ---- Cache dos frames já alinhados (~0,3 MB cada com o campo padrão) ----
 const cache = new Map<string, { buf: Buffer; info: string }>();
-const CACHE_MAX = 40;
-
-async function fetchWithRetry(url: string, tries = 3) {
-  let lastStatus = 0;
-  for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
-      if (res.ok) return res;
-      lastStatus = res.status;
-      if (res.status < 500 && res.status !== 429) break;
-    } catch {
-      lastStatus = 0;
-    }
-    await new Promise((r) => setTimeout(r, 800 * (i + 1)));
-  }
-  const err: any = new Error(`Erro no cutout IRSA: ${lastStatus || 'timeout/rede'}`);
-  err.status = lastStatus;
-  throw err;
-}
+const CACHE_MAX = 150;
 
 // ---- Parser de FITS (MEF) ----
 function parseHdus(buf: Buffer): Hdu[] {
@@ -162,8 +130,23 @@ function worldToPixel(w: Wcs, raDeg: number, decDeg: number): [number, number] |
   return [u + w.crpix[0] - 1, v + w.crpix[1] - 1];
 }
 
+// Campos de header que provavelmente dizem quando/como/em que cor o frame foi observado.
+// Nomes não confirmados: pega o que casar e o /api/inspect mostra o resto.
+const META_RE = /^(DATE|MJD|EXPT|EXPO|DETECT|OBSID|BAND|WAVE|LAMBDA|LAM)/i;
+function pickMeta(...headers: Record<string, string>[]) {
+  const meta: Record<string, string> = {};
+  for (const h of headers) {
+    for (const k of Object.keys(h)) {
+      if (Object.keys(meta).length >= 24) return meta;
+      if (META_RE.test(k) && !(k in meta)) meta[k] = h[k].replace(/[^\x20-\x7E]/g, '').slice(0, 40);
+    }
+  }
+  return meta;
+}
+
 export async function GET(request: Request) {
   const t0 = Date.now();
+  const signal = request.signal;
   const { searchParams } = new URL(request.url);
   const baseUrl = searchParams.get('url') || '';
   const raDeg = parseFloat(searchParams.get('ra') || '');
@@ -191,11 +174,15 @@ export async function GET(request: Request) {
   // O quadrado de saída (norte em cima) pode ficar girado em relação ao detector: recorte maior evita cantos vazios
   const cutoutUrl = `${baseUrl}?center=${raDeg},${decDeg}&size=${(fov * 1.45).toFixed(4)}`;
 
-  await acquire();
   try {
-    const response = await fetchWithRetry(cutoutUrl);
+    await acquire(signal);
+  } catch {
+    return new NextResponse(null, { status: 499 }); // cancelado na fila
+  }
+
+  try {
+    const buffer = await fetchBuffer(cutoutUrl, { signal, tries: 2, timeoutMs: 60000 });
     const tDown = Date.now() - t0;
-    const buffer = Buffer.from(await response.arrayBuffer());
 
     const hdus = parseHdus(buffer);
     const img =
@@ -263,6 +250,8 @@ export async function GET(request: Request) {
       ctype: wcs.ctype,
       sip: wcs.sipA.length > 0 || wcs.sipB.length > 0,
       src: `${W}x${H}`,
+      hdus: hdus.map((h) => h.header['EXTNAME'] || h.header['XTENSION'] || 'PRIMARY'),
+      meta: pickMeta(img.header, hdus[0]?.header || {}),
       downloadMs: tDown,
       totalMs: Date.now() - t0,
     });
@@ -275,6 +264,7 @@ export async function GET(request: Request) {
       headers: { 'Content-Type': 'application/octet-stream', 'X-Align-Info': info, 'Cache-Control': 'no-store' },
     });
   } catch (error: any) {
+    if (signal.aborted) return new NextResponse(null, { status: 499 });
     console.error('[align]', error.message);
     return NextResponse.json({ error: error.message }, { status: error.status === 422 ? 422 : 502 });
   } finally {

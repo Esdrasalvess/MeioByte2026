@@ -2,65 +2,17 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { keyOf, detOf, timeOf, mjdToDate, sortByTime, summarize, renderImage } from '../../lib/timeline';
+import { setTarget, want, retryErrors, getSlot, useFrameStore, type Loaded } from '../../lib/frameStore';
 
 type Center = { ra: string; dec: string; fov: number };
-type Loaded = { n: number; data: Float32Array; valid: number }; // valid: fração 0..1 de pixels com dado
-type Entry = Loaded | 'nocov' | 'err';
 type ViewMode = 'normal' | 'medsub' | 'mean';
 type Crop = { n: number; x: number; y: number; w: number; h: number };
+type Status = 'ok' | 'low' | 'pending' | 'loading' | 'err' | 'nocov';
 
-const DETECTORS = [
-  { id: 'D1', label: 'D1 · ≈0.75–1.1 µm' },
-  { id: 'D2', label: 'D2 · ≈1.1–1.6 µm' },
-  { id: 'D3', label: 'D3 · ≈1.6–2.4 µm' },
-  { id: 'D4', label: 'D4 · ≈2.4–3.8 µm' },
-  { id: 'D5', label: 'D5 · ≈3.8–4.4 µm' },
-  { id: 'D6', label: 'D6 · ≈4.4–5.0 µm' },
-];
-
-const WORKERS = 3;
-const RETRY_DELAYS = [0, 3000, 8000, 15000]; // 1ª tentativa + 3 retries
-const ATTEMPT_TIMEOUT = 150000;
 const EXPORT_MIN_SIDE = 720; // lado maior do vídeo exportado, em pixels
 
-const keyOf = (f: any): string => f?.access_url || '';
-const detOf = (f: any): string => {
-  const m = keyOf(f).match(/_\d+D(\d)_spx/);
-  return m ? `D${m[1]}` : '';
-};
-const timeOf = (f: any): number => {
-  const t = parseFloat(f?.time_bounds_lower);
-  if (Number.isFinite(t)) return t;
-  const d = Date.parse(f?.date || '');
-  return Number.isFinite(d) ? d / 86400000 + 40587 : 0;
-};
-
-const abortErr = () => new DOMException('aborted', 'AbortError');
-
-const sleep = (ms: number, signal: AbortSignal) =>
-  new Promise<void>((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
-  });
-
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-// Pede o frame alinhado; repete sozinho em erro de servidor/rede/timeout
-async function fetchAligned(url: string, signal: AbortSignal): Promise<Float32Array | 'nocov' | 'err'> {
-  for (let a = 0; a < RETRY_DELAYS.length; a++) {
-    if (RETRY_DELAYS[a]) await sleep(RETRY_DELAYS[a], signal);
-    if (signal.aborted) throw abortErr();
-    try {
-      const res = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(ATTEMPT_TIMEOUT)]) });
-      if (res.status === 422) return 'nocov';
-      if (res.ok) return new Float32Array(await res.arrayBuffer());
-      if (res.status < 500 && res.status !== 429) return 'err'; // erro do cliente: não adianta repetir
-    } catch {
-      if (signal.aborted) throw abortErr();
-    }
-  }
-  return 'err';
-}
 
 // Maior retângulo em que todos os pixels têm cnt >= min (algoritmo do histograma, O(n²))
 function largestRect(cnt: Uint16Array, n: number, min: number) {
@@ -95,137 +47,172 @@ function saveBlob(b: Blob, name: string) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+const TICK_COLOR: Record<Status, string> = {
+  ok: 'bg-blue-400',
+  low: 'bg-amber-600',
+  pending: 'bg-gray-600',
+  loading: 'bg-blue-300 animate-pulse',
+  err: 'bg-red-500',
+  nocov: 'bg-gray-800',
+};
+
+// Miniatura desenhada a partir do mesmo dado alinhado do vídeo
+function Thumb({ loaded, gain }: { loaded: Loaded; gain: number }) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const cv = ref.current;
+    if (!cv) return;
+    const img = renderImage(loaded.data, loaded.n, loaded.n, gain);
+    if (!img) return;
+    cv.width = loaded.n;
+    cv.height = loaded.n;
+    cv.getContext('2d')?.putImageData(img, 0, 0);
+  }, [loaded, gain]);
+  return <canvas ref={ref} className="w-full h-full object-cover" style={{ imageRendering: 'pixelated' }} />;
+}
+
 export default function TimelinePlayer({
   frames,
   center,
   active,
+  selectedKey,
+  onSelect,
 }: {
   frames: any[];
   center: Center;
   active: boolean;
+  selectedKey: string | null;
+  onSelect: (key: string) => void;
 }) {
-  const [det, setDet] = useState('D3');
-  const [idx, setIdx] = useState(0);
+  const version = useFrameStore();
+
+  const [det, setDet] = useState('');
   const [playing, setPlaying] = useState(false);
   const [fps, setFps] = useState(4);
   const [mode, setMode] = useState<ViewMode>('normal');
   const [gain, setGain] = useState(10);
   const [zoom, setZoom] = useState(1);
-  const [tick, setTick] = useState(0);
-  const [reload, setReload] = useState(0);
   const [minValid, setMinValid] = useState(60); // % mínima de pixels com dado para o frame entrar no vídeo
   const [autoCrop, setAutoCrop] = useState(true);
   const [showMark, setShowMark] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [exportPct, setExportPct] = useState(0);
+  const [panel, setPanel] = useState<null | 'help' | 'info'>(null);
 
-  const cacheRef = useRef(new Map<string, Entry>());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stripRef = useRef<HTMLDivElement | null>(null);
+  const selRef = useRef(selectedKey);
+  selRef.current = selectedKey;
+  const detRef = useRef(det);
+  detRef.current = det;
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
 
-  const ck = (f: any) => `${keyOf(f)}|${center.ra}|${center.dec}|${center.fov}`;
+  // Detectores que existem nos dados (nada fixo no código)
+  const dets = useMemo(() => {
+    const m = new Map<string, number>();
+    frames.forEach((f) => m.set(detOf(f), (m.get(detOf(f)) || 0) + 1));
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [frames]);
 
-  // Nova busca (outro alvo/campo): limpa tudo
-  useEffect(() => {
-    cacheRef.current.clear();
-    setIdx(0);
-    setTick((t) => t + 1);
-  }, [center.ra, center.dec, center.fov]);
-
-  // Se o detector escolhido não tem frames, vai para o primeiro que tem
-  useEffect(() => {
-    if (frames.length && !frames.some((f) => detOf(f) === det)) {
-      const first = DETECTORS.find((d) => frames.some((f) => detOf(f) === d.id));
-      if (first) setDet(first.id);
-    }
-  }, [frames, det]);
-
-  const list = useMemo(
-    () => frames.filter((f) => detOf(f) === det).sort((a, b) => timeOf(a) - timeOf(b)),
-    [frames, det]
-  );
-
-  // Baixa (3 por vez) os frames alinhados do detector escolhido
-  useEffect(() => {
-    if (!active || list.length === 0) return;
-    const ac = new AbortController();
-    const todo = list.filter((f) => !cacheRef.current.has(ck(f)));
-    let next = 0;
-
-    const worker = async () => {
-      while (next < todo.length && !ac.signal.aborted) {
-        const f = todo[next++];
-        const k = ck(f);
-        const url = `/api/align?url=${encodeURIComponent(keyOf(f))}&ra=${center.ra}&dec=${center.dec}&fov=${center.fov}`;
-        try {
-          const r = await fetchAligned(url, ac.signal);
-          if (r === 'nocov' || r === 'err') cacheRef.current.set(k, r);
-          else {
-            let ok = 0;
-            for (let i = 0; i < r.length; i++) if (Number.isFinite(r[i])) ok++;
-            cacheRef.current.set(k, { n: Math.round(Math.sqrt(r.length)), data: r, valid: ok / r.length });
-          }
-        } catch {
-          return; // cancelado
-        }
-        setTick((t) => t + 1);
-      }
-    };
-    for (let i = 0; i < WORKERS; i++) worker();
-    return () => ac.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, list, center.ra, center.dec, center.fov, reload]);
-
-  // Frames que chegaram (inclui os que serão descartados por cobertura baixa)
-  const loaded = useMemo(
-    () => list.filter((f) => {
-      const e = cacheRef.current.get(ck(f));
-      return e && typeof e === 'object';
-    }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [list, tick, center.ra, center.dec, center.fov]
-  );
-
-  // Frames que entram no vídeo: cobertura >= limite escolhido
-  const ready = useMemo(
-    () => loaded.filter((f) => (cacheRef.current.get(ck(f)) as Loaded).valid * 100 >= minValid),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [loaded, minValid]
-  );
-
-  const stats = useMemo(() => {
-    let nocov = 0, err = 0;
-    list.forEach((f) => {
-      const e = cacheRef.current.get(ck(f));
-      if (e === 'nocov') nocov++;
-      if (e === 'err') err++;
+  // Rótulo da faixa de cor, se a consulta trouxe (energy_bandpassname)
+  const bandLabel = useMemo(() => {
+    const seen = new Map<string, Set<string>>();
+    frames.forEach((f) => {
+      const d = detOf(f);
+      const b = String(f?.energy_bandpassname || '').trim();
+      if (!b || b.toUpperCase() === d) return;
+      if (!seen.has(d)) seen.set(d, new Set());
+      seen.get(d)!.add(b);
     });
-    return { nocov, err, low: loaded.length - ready.length };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list, loaded, ready, tick, center.ra, center.dec, center.fov]);
+    const out = new Map<string, string>();
+    seen.forEach((s, d) => out.set(d, [...s].slice(0, 2).join(' / ').slice(0, 28)));
+    return out;
+  }, [frames]);
 
-  // Retângulo comum: maior região sem buracos em todos os frames prontos (ou em 80% deles, se a região ficar pequena demais)
+  // Detector inicial: o da observação selecionada, ou o que tem mais frames
+  useEffect(() => {
+    if (!dets.length || dets.some(([d]) => d === det)) return;
+    const selFrame = frames.find((f) => keyOf(f) === selRef.current);
+    const pref = selFrame ? detOf(selFrame) : [...dets].sort((a, b) => b[1] - a[1])[0][0];
+    setDet(pref);
+  }, [dets, det, frames]);
+
+  // Se a seleção vier de fora, acompanha o detector dela
+  useEffect(() => {
+    if (!selectedKey) return;
+    const f = frames.find((x) => keyOf(x) === selectedKey);
+    if (f && detOf(f) !== detRef.current) setDet(detOf(f));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey]);
+
+  const list = useMemo(() => sortByTime(frames.filter((f) => detOf(f) === det)), [frames, det]);
+  const summary = useMemo(() => summarize(list), [list]);
+  const listKey = useMemo(() => list.map(keyOf).join('\n'), [list]);
+
+  // Pede ao armazém os frames do detector atual, em ordem de data (só com a aba ativa)
+  useEffect(() => {
+    setTarget({ ra: center.ra, dec: center.dec, fov: center.fov });
+    want(active ? list.map(keyOf) : []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, listKey, center.ra, center.dec, center.fov]);
+
+  const st = useMemo(() => {
+    const ready: any[] = [];
+    let nocov = 0, err = 0, low = 0, pending = 0;
+    for (const f of list) {
+      const s = getSlot(keyOf(f));
+      if (!s || s.status === 'queued' || s.status === 'loading') pending++;
+      else if (s.status === 'nocov') nocov++;
+      else if (s.status === 'err') err++;
+      else if (s.loaded!.valid * 100 >= minValid) ready.push(f);
+      else low++;
+    }
+    return { ready, nocov, err, low, pending };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, version, minValid]);
+  const ready = st.ready;
+
+  const statusOf = (f: any): Status => {
+    const s = getSlot(keyOf(f));
+    if (!s || s.status === 'queued') return 'pending';
+    if (s.status === 'loading') return 'loading';
+    if (s.status === 'ok') return s.loaded!.valid * 100 >= minValid ? 'ok' : 'low';
+    return s.status;
+  };
+
+  // Frame atual = o selecionado (se estiver no vídeo), senão o primeiro
+  const curIdx = ready.findIndex((f) => keyOf(f) === selectedKey);
+  const cur = curIdx >= 0 ? curIdx : 0;
+  const curFrame = ready[cur];
+  const curKey = curFrame ? keyOf(curFrame) : '';
+  const curLoaded = curKey ? getSlot(curKey)?.loaded : undefined;
+
+  // Mantém a seleção dentro do que está no vídeo
+  useEffect(() => {
+    if (ready.length && curIdx < 0) onSelectRef.current(keyOf(ready[0]));
+  }, [ready, curIdx]);
+
+  // Retângulo comum: maior região sem buracos em todos os frames prontos (ou em 80% deles, se ficar pequena demais)
   const crop = useMemo<Crop | null>(() => {
     if (ready.length === 0) return null;
-    const first = cacheRef.current.get(ck(ready[0])) as Loaded;
+    const first = getSlot(keyOf(ready[0]))!.loaded!;
     const n = first.n;
     const full: Crop = { n, x: 0, y: 0, w: n, h: n };
     if (!autoCrop) return full;
-    const arrs = ready.map((f) => cacheRef.current.get(ck(f)) as Loaded).filter((a) => a.n === n);
+    const arrs = ready.map((f) => getSlot(keyOf(f))!.loaded!).filter((a) => a.n === n);
     const cnt = new Uint16Array(n * n);
-    for (const a of arrs) {
-      for (let p = 0; p < n * n; p++) if (Number.isFinite(a.data[p])) cnt[p]++;
-    }
+    for (const a of arrs) for (let p = 0; p < n * n; p++) if (Number.isFinite(a.data[p])) cnt[p]++;
     let r = largestRect(cnt, n, arrs.length);
     if (r.area < 0.25 * n * n) r = largestRect(cnt, n, Math.ceil(arrs.length * 0.8));
     if (r.area < 0.05 * n * n) return full;
     return { n, x: r.x, y: r.y, w: r.w, h: r.h };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, autoCrop, center.ra, center.dec, center.fov]);
+  }, [ready, autoCrop]);
 
-  // Média ou mediana pixel a pixel de todos os frames prontos
+  // Média ou mediana pixel a pixel dos frames prontos
   const stack = useMemo(() => {
     if (mode === 'normal' || ready.length < 2) return null;
-    const all = ready.map((f) => cacheRef.current.get(ck(f)) as Loaded);
+    const all = ready.map((f) => getSlot(keyOf(f))!.loaded!);
     const n = all[0].n;
     const arrs = all.filter((a) => a.n === n);
     const out = new Float32Array(n * n);
@@ -247,62 +234,39 @@ export default function TimelinePlayer({
       }
     }
     return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, mode]);
 
-  // Play (toca o que já estiver pronto, mesmo com o resto ainda baixando)
+  // Play: avança a seleção (a seleção é única, vale também para a faixa e o painel lateral)
+  const readyRef = useRef(ready);
+  readyRef.current = ready;
   useEffect(() => {
     if (!playing || ready.length < 2 || mode === 'mean') return;
-    const t = setInterval(() => setIdx((i) => (i + 1) % ready.length), 1000 / fps);
+    const t = setInterval(() => {
+      const r = readyRef.current;
+      if (r.length < 2) return;
+      const i = r.findIndex((f) => keyOf(f) === selRef.current);
+      onSelectRef.current(keyOf(r[(i + 1) % r.length]));
+    }, 1000 / fps);
     return () => clearInterval(t);
   }, [playing, fps, ready.length, mode]);
 
-  const cur = ready.length ? Math.min(idx, ready.length - 1) : 0;
-
-  // Monta os pixels (já recortados) do frame i, com o stretch aplicado
+  // Pixels (já recortados) do frame i
   const buildImage = (i: number): ImageData | null => {
     if (!crop || !ready[i]) return null;
-    const entry = cacheRef.current.get(ck(ready[i])) as Loaded | undefined;
-    if (!entry || typeof entry !== 'object' || entry.n !== crop.n) return null;
+    const e = getSlot(keyOf(ready[i]))?.loaded;
+    if (!e || e.n !== crop.n) return null;
     const { n, x, y, w, h } = crop;
-
     const vals = new Float32Array(w * h);
     for (let j = 0; j < h; j++) {
       for (let k = 0; k < w; k++) {
         const p = (y + j) * n + (x + k);
-        let v = entry.data[p];
+        let v = e.data[p];
         if (mode === 'mean' && stack) v = stack[p];
-        else if (mode === 'medsub' && stack) v = entry.data[p] - stack[p];
+        else if (mode === 'medsub' && stack) v = e.data[p] - stack[p];
         vals[j * w + k] = v;
       }
     }
-
-    // Stretch robusto: mediana e sigma via MAD
-    const sample: number[] = [];
-    const stride = Math.max(1, Math.floor(vals.length / 20000));
-    for (let k = 0; k < vals.length; k += stride) if (Number.isFinite(vals[k])) sample.push(vals[k]);
-    if (!sample.length) return null;
-    sample.sort((a, b) => a - b);
-    const med = sample[sample.length >> 1];
-    const dev = sample.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
-    const sigma = 1.4826 * dev[dev.length >> 1] || 1;
-    const lo = med - 2 * sigma;
-    const range = med + gain * sigma - lo || 1;
-
-    const img = new ImageData(w, h);
-    for (let p = 0; p < w * h; p++) {
-      const v = vals[p];
-      let r = 15, g = 15, b = 30; // sem cobertura
-      if (Number.isFinite(v)) {
-        const t = Math.min(1, Math.max(0, (v - lo) / range));
-        r = g = b = Math.floor(Math.sqrt(t) * 255);
-      }
-      img.data[p * 4] = r;
-      img.data[p * 4 + 1] = g;
-      img.data[p * 4 + 2] = b;
-      img.data[p * 4 + 3] = 255;
-    }
-    return img;
+    return renderImage(vals, w, h, gain);
   };
 
   // Desenho na tela
@@ -317,9 +281,9 @@ export default function TimelinePlayer({
     if (!ctx) return;
     ctx.putImageData(img, 0, 0);
     if (showMark) {
-      // O alvo fica no centro da grade original (n/2, n/2)
-      const mx = crop.n / 2 - crop.x;
-      const my = crop.n / 2 - crop.y;
+      // O alvo fica no centro da grade original: (n-1)/2, como em sky.ts
+      const mx = (crop.n - 1) / 2 - crop.x;
+      const my = (crop.n - 1) / 2 - crop.y;
       ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
       ctx.lineWidth = Math.max(1, Math.max(crop.w, crop.h) / 220);
       ctx.beginPath();
@@ -327,7 +291,17 @@ export default function TimelinePlayer({
       ctx.stroke();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cur, mode, gain, ready, stack, crop, showMark]);
+  }, [curKey, mode, gain, ready, stack, crop, showMark]);
+
+  // Mantém a miniatura atual visível na faixa
+  useEffect(() => {
+    if (!active) return;
+    const i = list.findIndex((f) => keyOf(f) === curKey);
+    if (i < 0) return;
+    stripRef.current
+      ?.querySelector(`[data-i="${i}"]`)
+      ?.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }, [curKey, active, list]);
 
   // Exporta: vídeo .webm (ou PNG na visão "Empilhada")
   const exportMedia = async () => {
@@ -355,10 +329,7 @@ export default function TimelinePlayer({
         tctx.putImageData(img, 0, 0);
         octx.imageSmoothingEnabled = false;
         octx.drawImage(tmp, 0, 0, W, H);
-        const label =
-          mode === 'mean'
-            ? `${det} · média de ${ready.length} frames`
-            : `${det} · ${ready[i]?.date || ''}`;
+        const label = mode === 'mean' ? `${det} · média de ${ready.length} frames` : `${det} · ${ready[i]?.date || ''}`;
         octx.font = `${fontPx}px ui-monospace, monospace`;
         octx.textBaseline = 'bottom';
         octx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -371,24 +342,18 @@ export default function TimelinePlayer({
 
       if (mode === 'mean' || ready.length < 2) {
         drawFrame(cur);
-        await new Promise<void>((res) =>
-          out.toBlob((b) => { if (b) saveBlob(b, `${baseName}.png`); res(); }, 'image/png')
-        );
+        await new Promise<void>((res) => out.toBlob((b) => { if (b) saveBlob(b, `${baseName}.png`); res(); }, 'image/png'));
         return;
       }
-
       if (typeof MediaRecorder === 'undefined') {
         alert('Este navegador não suporta gravação de vídeo. Use Chrome, Edge ou Firefox.');
         return;
       }
-      const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) =>
-        MediaRecorder.isTypeSupported(m)
-      );
+      const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m));
       if (!mime) {
         alert('Este navegador não grava .webm. Use Chrome, Edge ou Firefox.');
         return;
       }
-
       const stream = out.captureStream(fps);
       const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
       const chunks: Blob[] = [];
@@ -413,18 +378,36 @@ export default function TimelinePlayer({
     }
   };
 
-  const curFrame = ready[cur];
-  const curEntry = curFrame ? (cacheRef.current.get(ck(curFrame)) as Loaded | undefined) : undefined;
-  const pending = list.length - loaded.length - stats.nocov - stats.err;
-  const retryErrors = () => {
-    list.forEach((f) => {
-      if (cacheRef.current.get(ck(f)) === 'err') cacheRef.current.delete(ck(f));
-    });
-    setReload((r) => r + 1);
+  // Eixo do tempo: posição de cada observação pela data (ou espaçada igualmente se faltarem datas)
+  const axis = useMemo(() => {
+    const n = list.length;
+    const ts = list.map(timeOf);
+    const ok = n > 0 && ts.every((t) => t !== null);
+    const t0 = ok ? Math.min(...(ts as number[])) : 0;
+    const t1 = ok ? Math.max(...(ts as number[])) : 0;
+    const span = t1 - t0;
+    const pos = list.map((_, i) => (ok && span > 0 ? ((ts[i] as number) - t0) / span : n > 1 ? i / (n - 1) : 0.5));
+    const bands = ok && span > 0 ? summary.groups.map((g) => ({ l: (g.t0 - t0) / span, w: (g.t1 - g.t0) / span })) : [];
+    return { pos, bands };
+  }, [list, summary]);
+
+  const pick = (f: any) => {
+    const s = statusOf(f);
+    if (s !== 'ok') return; // só frames já prontos e com cobertura suficiente
+    setPlaying(false);
+    onSelect(keyOf(f));
+  };
+  const goto = (i: number) => {
+    if (!ready.length) return;
+    onSelect(keyOf(ready[Math.max(0, Math.min(ready.length - 1, i))]));
   };
 
   const sel = 'bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white outline-none';
   const aspect = crop ? crop.w / crop.h : 1;
+  const sumText =
+    summary.t0 !== null
+      ? `${mjdToDate(summary.t0)} → ${mjdToDate(summary.t1!)} (${Math.round(summary.spanDays!)} dias) · ${summary.groups.length} período(s) de observação`
+      : 'observações sem data na consulta';
 
   return (
     <div className="absolute inset-0 flex flex-col bg-black">
@@ -432,13 +415,14 @@ export default function TimelinePlayer({
       <div className="flex flex-wrap items-center gap-2 p-2 text-xs bg-gray-900/90 border-b border-gray-800">
         <select
           value={det}
-          onChange={(e) => { setDet(e.target.value); setIdx(0); }}
+          onChange={(e) => setDet(e.target.value)}
           className={sel}
-          title="Cada detector enxerga uma faixa de cor (comprimento de onda) diferente"
+          title="Cada detector cobre uma faixa de cor do infravermelho. Compare frames do mesmo detector."
         >
-          {DETECTORS.map((d) => (
-            <option key={d.id} value={d.id} className="bg-gray-900">
-              {d.label} ({frames.filter((f) => detOf(f) === d.id).length})
+          {dets.map(([d, n]) => (
+            <option key={d} value={d} className="bg-gray-900">
+              {d}
+              {bandLabel.get(d) ? ` · ${bandLabel.get(d)}` : ''} ({n})
             </option>
           ))}
         </select>
@@ -446,7 +430,7 @@ export default function TimelinePlayer({
           value={mode}
           onChange={(e) => setMode(e.target.value as ViewMode)}
           className={sel}
-          title="Normal: imagens como vieram. − mediana: tira o que é fixo e deixa só o que se move ou varia. Empilhada: soma tudo para ver coisas fracas."
+          title="Normal: como veio. − mediana: tira o que é fixo e deixa só o que se move ou varia. Empilhada: média de todas as datas, para ver coisas fracas."
         >
           <option value="normal" className="bg-gray-900">Normal</option>
           <option value="medsub" className="bg-gray-900">− mediana (realça o que se move)</option>
@@ -466,10 +450,7 @@ export default function TimelinePlayer({
           <input type="range" min={1} max={8} step={0.5} value={zoom} onChange={(e) => setZoom(+e.target.value)} />
           {zoom}x
         </label>
-        <label
-          className="flex items-center gap-1 text-gray-400"
-          title="Frames em que o detector cobre menos que isso da área são deixados de fora do vídeo"
-        >
+        <label className="flex items-center gap-1 text-gray-400" title="Frames em que o detector cobre menos que isso da área ficam fora do vídeo">
           cobertura mín.
           <input type="range" min={0} max={100} step={5} value={minValid} onChange={(e) => setMinValid(+e.target.value)} />
           {minValid}%
@@ -478,7 +459,7 @@ export default function TimelinePlayer({
           <input type="checkbox" checked={autoCrop} onChange={(e) => setAutoCrop(e.target.checked)} />
           recorte automático
         </label>
-        <label className="flex items-center gap-1 text-gray-400" title="Círculo amarelo na posição do alvo (coordenadas digitadas)">
+        <label className="flex items-center gap-1 text-gray-400" title="Círculo amarelo na posição digitada (catálogo, época J2000)">
           <input type="checkbox" checked={showMark} onChange={(e) => setShowMark(e.target.checked)} />
           marcar alvo
         </label>
@@ -486,19 +467,23 @@ export default function TimelinePlayer({
           onClick={exportMedia}
           disabled={exporting || ready.length === 0}
           className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 px-3 py-0.5 rounded-full text-white"
-          title="Grava os frames mostrados em um arquivo de vídeo (.webm). Na visão Empilhada, baixa uma imagem PNG."
+          title="Grava os frames mostrados em um vídeo (.webm). Na visão Empilhada, baixa um PNG."
         >
-          {exporting
-            ? `Gravando... ${exportPct}%`
-            : mode === 'mean' || ready.length < 2
-            ? 'Baixar PNG'
-            : 'Baixar vídeo (.webm)'}
+          {exporting ? `Gravando... ${exportPct}%` : mode === 'mean' || ready.length < 2 ? 'Baixar PNG' : 'Baixar vídeo (.webm)'}
         </button>
-        {stats.err > 0 && (
+        {st.err > 0 && (
           <button onClick={retryErrors} className="bg-blue-600 hover:bg-blue-500 px-3 py-0.5 rounded-full text-white">
-            Tentar {stats.err} erros de novo
+            Tentar {st.err} erros de novo
           </button>
         )}
+        <span className="flex-1" />
+        <button onClick={() => setPanel((p) => (p === 'help' ? null : 'help'))} className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700">? ajuda</button>
+        <button onClick={() => setPanel((p) => (p === 'info' ? null : 'info'))} className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700">ⓘ detalhes</button>
+      </div>
+
+      {/* Resumo calculado dos dados */}
+      <div className="px-3 py-1 text-[11px] text-gray-300 bg-gray-900/60 border-b border-gray-800 font-mono truncate">
+        {det || '—'}: {summary.count} observações · {sumText}
       </div>
 
       {/* Imagem */}
@@ -507,14 +492,12 @@ export default function TimelinePlayer({
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-xs text-gray-500 px-6 text-center">
             {list.length === 0 ? (
               'Nenhum frame deste detector para esse alvo.'
-            ) : loaded.length > 0 ? (
-              <span>
-                {loaded.length} frame(s) chegaram, mas todos têm cobertura abaixo de {minValid}%. Reduza a "cobertura mín.".
-              </span>
+            ) : st.low > 0 && st.pending === 0 ? (
+              <span>{st.low} frame(s) chegaram, mas todos têm cobertura abaixo de {minValid}%. Reduza a "cobertura mín.".</span>
             ) : (
               <>
                 <div className="h-8 w-8 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
-                <span>Alinhando frames... {pending} na fila (cada um leva 10–25 s na IRSA)</span>
+                <span>Alinhando frames... {st.pending} na fila (cada um leva 10–25 s na IRSA)</span>
               </>
             )}
           </div>
@@ -533,10 +516,55 @@ export default function TimelinePlayer({
             <canvas ref={canvasRef} className="w-full h-full" style={{ imageRendering: 'pixelated' }} />
           </div>
         )}
+
+        {panel === 'help' && (
+          <div className="absolute top-2 left-2 right-2 max-w-xl z-10 bg-gray-900/95 border border-gray-700 rounded p-3 text-[11px] text-gray-300 leading-relaxed">
+            <b className="text-white">Como ler esta tela.</b> O ponto que você escolheu foi fotografado várias vezes pelo SPHEREx.
+            Cada traço no eixo de tempo é uma observação; os blocos cinza são períodos de observação seguidos, agrupados
+            automaticamente, e os vazios entre eles são lacunas. A imagem mostra o mesmo pedaço do céu em cada data:
+            o que é fixo fica parado, e o que se move entre datas é candidato a asteroide, cometa ou estrela próxima.
+            O modo "− mediana" apaga o que não muda e deixa só o que varia. Cada detector vê uma faixa de cor do infravermelho,
+            e a cor muda dentro da imagem, então compare frames do mesmo detector. Clique num traço ou numa miniatura para ir à observação.
+          </div>
+        )}
+        {panel === 'info' && (
+          <div className="absolute top-2 right-2 w-96 max-h-[80%] overflow-auto z-10 bg-gray-900/95 border border-gray-700 rounded p-3 text-[10px] text-gray-300 font-mono">
+            <div className="text-white mb-1">Frame atual: {curFrame?.date || '—'} · {det}</div>
+            <pre className="whitespace-pre-wrap break-all">
+              {curLoaded?.info ? JSON.stringify(curLoaded.info, null, 1) : 'Sem metadados (atualize o /api/align para a versão nova).'}
+            </pre>
+          </div>
+        )}
       </div>
 
-      {/* Linha do tempo */}
-      <div className="p-2 bg-gray-900/90 border-t border-gray-800 flex items-center gap-3 text-xs">
+      {/* Eixo do tempo */}
+      <div className="px-3 pt-2 bg-gray-900/90 border-t border-gray-800">
+        <div className="relative h-8 mx-1" title="Cada traço é uma observação, na posição da sua data">
+          {axis.bands.map((b, i) => (
+            <div key={i} className="absolute top-2.5 h-3 rounded bg-gray-800" style={{ left: `${b.l * 100}%`, width: `${Math.max(b.w * 100, 0.8)}%` }} />
+          ))}
+          {list.map((f, i) => {
+            const k = keyOf(f);
+            const isCur = k === curKey;
+            return (
+              <button
+                key={k}
+                onClick={() => pick(f)}
+                title={`${f.date || 'sem data'} · ${statusOf(f)}`}
+                className={`absolute -translate-x-1/2 rounded-sm ${isCur ? 'bg-white top-0 h-8 w-[3px] z-10' : `${TICK_COLOR[statusOf(f)]} top-0.5 h-7 w-[5px]`}`}
+                style={{ left: `${axis.pos[i] * 100}%` }}
+              />
+            );
+          })}
+        </div>
+        <div className="flex justify-between text-[10px] text-gray-500 font-mono mx-1">
+          <span>{summary.t0 !== null ? mjdToDate(summary.t0) : ''}</span>
+          <span>{summary.t1 !== null ? mjdToDate(summary.t1) : ''}</span>
+        </div>
+      </div>
+
+      {/* Reprodução */}
+      <div className="p-2 bg-gray-900/90 flex items-center gap-3 text-xs">
         <button
           onClick={() => setPlaying((p) => !p)}
           disabled={ready.length < 2 || mode === 'mean'}
@@ -544,30 +572,64 @@ export default function TimelinePlayer({
         >
           {playing ? '⏸ Pausar' : '▶ Play'}
         </button>
-        <button onClick={() => setIdx((i) => Math.max(0, Math.min(i, ready.length - 1) - 1))} className="px-2 py-1 bg-gray-800 rounded">◀</button>
+        <button onClick={() => goto(cur - 1)} className="px-2 py-1 bg-gray-800 rounded">◀</button>
         <input
           type="range"
           min={0}
           max={Math.max(0, ready.length - 1)}
           value={cur}
-          onChange={(e) => { setPlaying(false); setIdx(+e.target.value); }}
+          onChange={(e) => { setPlaying(false); goto(+e.target.value); }}
           className="flex-1"
         />
-        <button onClick={() => setIdx((i) => Math.min(ready.length - 1, Math.min(i, ready.length - 1) + 1))} className="px-2 py-1 bg-gray-800 rounded">▶</button>
+        <button onClick={() => goto(cur + 1)} className="px-2 py-1 bg-gray-800 rounded">▶</button>
         <span className="font-mono text-gray-300 min-w-56 text-right">
           {mode === 'mean'
             ? `média de ${ready.length} frames`
             : ready.length
-            ? `${cur + 1}/${ready.length} · ${curFrame?.date || '—'}${curEntry ? ` · ${Math.round(curEntry.valid * 100)}% cob.` : ''}`
+            ? `${cur + 1}/${ready.length} · ${curFrame?.date || '—'}${curLoaded ? ` · ${Math.round(curLoaded.valid * 100)}% cob.` : ''}`
             : '—'}
         </span>
         <span className="font-mono text-gray-500">
           {ready.length}/{list.length} ok
-          {pending > 0 ? ` · ${pending} baixando` : ''}
-          {stats.low ? ` · ${stats.low} descartados` : ''}
-          {stats.nocov ? ` · ${stats.nocov} sem cob.` : ''}
-          {stats.err ? ` · ${stats.err} erros` : ''}
+          {st.pending > 0 ? ` · ${st.pending} baixando` : ''}
+          {st.low ? ` · ${st.low} descartados` : ''}
+          {st.nocov ? ` · ${st.nocov} sem cob.` : ''}
+          {st.err ? ` · ${st.err} erros` : ''}
         </span>
+      </div>
+
+      {/* Miniaturas (mesmo dado do vídeo, em ordem de data) */}
+      <div ref={stripRef} className="h-28 shrink-0 flex gap-1.5 overflow-x-auto overflow-y-hidden p-2 bg-gray-950 border-t border-gray-800">
+        {list.map((f, i) => {
+          const k = keyOf(f);
+          const s = getSlot(k);
+          const status = statusOf(f);
+          return (
+            <div
+              key={k}
+              data-i={i}
+              onClick={() => pick(f)}
+              className={`shrink-0 w-20 flex flex-col gap-0.5 p-0.5 rounded border ${
+                k === curKey ? 'border-blue-500 bg-gray-800' : 'border-gray-800 bg-gray-900'
+              } ${status === 'ok' ? 'cursor-pointer hover:border-gray-600' : 'opacity-70'}`}
+            >
+              <div className="h-20 bg-black rounded overflow-hidden flex items-center justify-center">
+                {s?.status === 'ok' ? (
+                  <Thumb loaded={s.loaded!} gain={gain} />
+                ) : status === 'loading' ? (
+                  <div className="h-4 w-4 rounded-full border-2 border-gray-700 border-t-blue-500 animate-spin" />
+                ) : status === 'err' ? (
+                  <span className="text-[9px] text-red-400">erro</span>
+                ) : status === 'nocov' ? (
+                  <span className="text-[9px] text-gray-600">sem cob.</span>
+                ) : (
+                  <span className="text-[9px] text-gray-700">…</span>
+                )}
+              </div>
+              <div className="text-[9px] text-gray-400 font-mono truncate">{f.date || `#${i + 1}`}</div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

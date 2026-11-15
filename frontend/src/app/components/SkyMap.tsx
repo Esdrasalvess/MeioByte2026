@@ -1,5 +1,6 @@
 'use client';
 import TimelinePlayer from './TimelinePlayer';
+import { parseCoords } from '../../lib/coords';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -153,6 +154,7 @@ function setSurvey(aladin: any, A: any, url: string, onError: (m: string) => voi
 }
 export default function SkyMap() {
   const [ra, setRa] = useState('269.452075');
+  const [picked, setPicked] = useState<{ ra: number; dec: number } | null>(null);
   const [dec, setDec] = useState('4.693391');
   const [fov, setFov] = useState(0.24);
   const [band, setBand] = useState('color');
@@ -252,6 +254,12 @@ const bandUrl = surveyUrl(bandRef.current);
           });
 
           moveMap(c);
+          aladinRef.current.on('click', (e: any) => {
+  if (e?.isDragging) return; // arraste não conta como clique
+  if (!Number.isFinite(e?.ra) || !Number.isFinite(e?.dec)) return;
+  addLog('info', `Clique no mapa: RA ${e.ra.toFixed(5)}, Dec ${e.dec.toFixed(5)}`);
+  setPicked({ ra: e.ra, dec: e.dec });
+});
           setMapState('ready');
           setMapMsg('Mapa pronto');
           addLog('ok', `Aladin pronto · HiPS ${bandRef.current}`);
@@ -408,6 +416,7 @@ const cancelQueued = (key: string) => {
     setSelectedKey(null);
     setView({ s: 1, x: 0, y: 0 });
     setMode('map');
+    setPicked(null);
     setPhase('searching');
     setStatusMsg('Consultando a IRSA (pode levar até 30 s se ela estiver lenta)...');
     addLog('info', `Busca: RA ${c.ra}, Dec ${c.dec}, campo ${c.fov}°`);
@@ -475,10 +484,20 @@ const cancelQueued = (key: string) => {
     if (first) setSelectedKey(frameKey(first));
   }, [tiles, frames]);
 
-  const handleSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    fetchData(ra, dec, fov);
-  };
+ const handleSearch = (e: React.FormEvent) => {
+  e.preventDefault();
+  const p = parseCoords(`${ra} ${dec}`);
+  if (!p) {
+    setPhase('error');
+    setStatusMsg('Não entendi as coordenadas. Exemplos: "269.452 4.693" ou "08h55m10.8s -07d14m42s". Dá para colar as duas no campo RA.');
+    return;
+  }
+  const r = String(p.ra);
+  const d = String(p.dec);
+  setRa(r);
+  setDec(d);
+  fetchData(r, d, fov);
+};
 
   const selectTarget = (t: { ra: string; dec: string }) => {
     setRa(t.ra);
@@ -548,7 +567,7 @@ if (phase === 'searching') banner = { color: blue, text: '⏳ ' + statusMsg };
 else if (phase === 'error') banner = { color: 'bg-red-900/40 border-red-700 text-red-200', text: '❌ ' + statusMsg };
 else if (frames.length === 0) banner = { color: 'bg-gray-800 border-gray-700 text-gray-300', text: statusMsg || 'Pronto.' };
 else if (requested.length === 0)
-  banner = { color: blue, text: `${frames.length} observações encontradas. Os recortes baixam conforme aparecem na faixa.` };
+  banner = { color: blue, text: `${frames.length} observações encontradas. Abra "Linha do tempo" para ver como esse pedaço do céu muda.` };
 else if (!allDone)
   banner = { color: blue, text: `⏳ Baixando os recortes visíveis: ${done}/${requested.length} (de ${frames.length})` };
 else if (counts.ok === 0)
@@ -643,19 +662,13 @@ else
               >
                 🗺️ Mapa do céu
               </button>
-              <button
-                onClick={() => setMode('frame')}
-                disabled={!selectedFrame}
-                className={`px-3 py-1 transition disabled:opacity-40 ${mode === 'frame' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
-              >
-                🎞️ Frame individual
-              </button>
+
               <button
   onClick={() => setMode('video')}
   disabled={frames.length === 0}
   className={`px-3 py-1 transition disabled:opacity-40 ${mode === 'video' ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
 >
-  🎬 Linha do tempo
+  🎬 Linha do tempo{frames.length ? ` · ${frames.length} obs.` : ''}
 </button>
             </div>
 
@@ -711,6 +724,38 @@ else
                   )}
                 </div>
               )}
+              {frames.length > 0 && (
+  <button
+    onClick={() => setMode('video')}
+    className="absolute bottom-3 right-3 z-10 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium px-4 py-2 rounded-full shadow"
+  >
+    {picked && (
+  <div className="absolute top-3 left-3 z-10 bg-gray-900/95 border border-gray-700 rounded p-3 text-xs flex flex-col gap-2">
+    <span className="font-mono text-gray-200">
+      RA {picked.ra.toFixed(5)} · Dec {picked.dec.toFixed(5)}
+    </span>
+    <div className="flex gap-2">
+      <button
+        onClick={() => {
+          const r = picked.ra.toFixed(6);
+          const d = picked.dec.toFixed(6);
+          setRa(r);
+          setDec(d);
+          fetchData(r, d, fov);
+        }}
+        className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1 rounded"
+      >
+        Gerar linha do tempo aqui
+      </button>
+      <button onClick={() => setPicked(null)} className="bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded">
+        cancelar
+      </button>
+    </div>
+  </div>
+)}
+    ▶ Ver como esse pedaço do céu muda no tempo
+  </button>
+)}
               {mapState === 'ready' && (
                 <div className="absolute bottom-2 left-3 text-[10px] text-gray-300 font-mono pointer-events-none z-10 drop-shadow">
 Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames                </div>
@@ -772,7 +817,13 @@ Fundo: HiPS do CDS · círculo amarelo = área do recorte dos frames            
               </div>
             </div>
             <div className={`absolute inset-0 ${mode === 'video' ? '' : 'invisible pointer-events-none'}`}>
-              <TimelinePlayer frames={frames} center={center} active={mode === 'video'} />
+              <TimelinePlayer
+  frames={frames}
+  center={center}
+  active={mode === 'video'}
+  selectedKey={selectedKey}
+  onSelect={(k) => { userPickedRef.current = true; setSelectedKey(k); }}
+/>
             </div>
           </div>
 
