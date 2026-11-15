@@ -716,10 +716,15 @@ else
                 {t.name}
               </button>
             ))}
+
+            <a href="https://gioperovano.github.io/astrobyte2/ar/">
+            <button className='ml-5 font-bold transition-all bg-amber-600 p-2 rounded-2xl hover:cursor-pointer hover:bg-amber-400 hover:text-black'>AstroByte</button></a>
+            
           </div>
         </div>
 
         <form onSubmit={handleSearch} className="flex gap-2 items-center text-sm">
+          
           <div className="flex items-center gap-1 bg-gray-800 border border-gray-700 px-2 py-1 rounded">
             <span className="text-[10px] text-gray-400">RA:</span>
             <input type="text" value={ra} onChange={(e) => setRa(e.target.value)} className="w-20 bg-transparent text-white text-xs outline-none" />
